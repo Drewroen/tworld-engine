@@ -96,6 +96,8 @@ import {
   creaturedirid,
   iskey,
   isboots,
+  isice,
+  isslide,
   iscreature,
   right,
   Tile,
@@ -142,6 +144,140 @@ export enum ChipStatus {
   CHIP_SQUISHED_DEATH,
   CHIP_NOTOKAY,
 }
+
+/*
+ * The laws of movement across the various floors. (mslogic.c:770-922)
+ *
+ * Chip, blocks, and other creatures all have slightly different rules
+ * about what sort of tiles they are permitted to move into. The
+ * following lookup table encapsulates these rules. Note that these
+ * rules are only the first check; a creature may be occasionally
+ * permitted a particular type of move but still prevented in a specific
+ * situation.
+ *
+ * Note this table's SHAPE is meaningfully different from Lynx's own
+ * movelaws table (see lynx.ts): MS's table has no separate IN/OUT bit
+ * positions, just a single directional bitmask per field, used for both
+ * entering and leaving a tile in all cases.
+ */
+const NWSE = NORTH | WEST | SOUTH | EAST;
+
+interface MoveLaw {
+  chip: number;
+  block: number;
+  creature: number;
+}
+
+/* Indexed by floor tile ID (0x00-0x3F). Transcribed directly from
+ * mslogic.c:786-922, entry by entry, in the same order; comments name
+ * the tile at that index (matching the `Tile` enum in ../constants), but
+ * it is the array *position* that mslogic.c relies on, not the comment.
+ */
+const movelaws: readonly MoveLaw[] = [
+  { chip: 0, block: 0, creature: 0 }, // Nothing
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Empty
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Slide_North
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Slide_West
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Slide_South
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Slide_East
+  { chip: NWSE, block: NWSE, creature: 0 }, // Slide_Random
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Ice
+  { chip: SOUTH | EAST, block: SOUTH | EAST, creature: SOUTH | EAST }, // IceWall_Northwest
+  { chip: SOUTH | WEST, block: SOUTH | WEST, creature: SOUTH | WEST }, // IceWall_Northeast
+  { chip: NORTH | EAST, block: NORTH | EAST, creature: NORTH | EAST }, // IceWall_Southwest
+  { chip: NORTH | WEST, block: NORTH | WEST, creature: NORTH | WEST }, // IceWall_Southeast
+  { chip: NWSE, block: NWSE, creature: 0 }, // Gravel
+  { chip: NWSE, block: 0, creature: 0 }, // Dirt
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Water
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Fire
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Bomb
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Beartrap
+  { chip: NWSE, block: 0, creature: 0 }, // Burglar
+  { chip: NWSE, block: NWSE, creature: NWSE }, // HintButton
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Button_Blue
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Button_Green
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Button_Red
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Button_Brown
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Teleport
+  { chip: 0, block: 0, creature: 0 }, // Wall
+  {
+    chip: NORTH | WEST | EAST,
+    block: NORTH | WEST | EAST,
+    creature: NORTH | WEST | EAST,
+  }, // Wall_North
+  {
+    chip: NORTH | WEST | SOUTH,
+    block: NORTH | WEST | SOUTH,
+    creature: NORTH | WEST | SOUTH,
+  }, // Wall_West
+  {
+    chip: WEST | SOUTH | EAST,
+    block: WEST | SOUTH | EAST,
+    creature: WEST | SOUTH | EAST,
+  }, // Wall_South
+  {
+    chip: NORTH | SOUTH | EAST,
+    block: NORTH | SOUTH | EAST,
+    creature: NORTH | SOUTH | EAST,
+  }, // Wall_East
+  { chip: SOUTH | EAST, block: SOUTH | EAST, creature: SOUTH | EAST }, // Wall_Southeast
+  { chip: 0, block: 0, creature: 0 }, // HiddenWall_Perm
+  { chip: NWSE, block: 0, creature: 0 }, // HiddenWall_Temp
+  { chip: NWSE, block: 0, creature: 0 }, // BlueWall_Real
+  { chip: NWSE, block: 0, creature: 0 }, // BlueWall_Fake
+  { chip: NWSE, block: NWSE, creature: NWSE }, // SwitchWall_Open
+  { chip: 0, block: 0, creature: 0 }, // SwitchWall_Closed
+  { chip: NWSE, block: 0, creature: 0 }, // PopupWall
+  { chip: 0, block: 0, creature: 0 }, // CloneMachine
+  { chip: NWSE, block: 0, creature: 0 }, // Door_Red
+  { chip: NWSE, block: 0, creature: 0 }, // Door_Blue
+  { chip: NWSE, block: 0, creature: 0 }, // Door_Yellow
+  { chip: NWSE, block: 0, creature: 0 }, // Door_Green
+  { chip: NWSE, block: 0, creature: 0 }, // Socket
+  { chip: NWSE, block: NWSE, creature: 0 }, // Exit
+  { chip: NWSE, block: 0, creature: 0 }, // ICChip
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Key_Red
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Key_Blue
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Key_Yellow
+  { chip: NWSE, block: NWSE, creature: NWSE }, // Key_Green
+  { chip: NWSE, block: NWSE, creature: 0 }, // Boots_Ice
+  { chip: NWSE, block: NWSE, creature: 0 }, // Boots_Slide
+  { chip: NWSE, block: NWSE, creature: 0 }, // Boots_Fire
+  { chip: NWSE, block: NWSE, creature: 0 }, // Boots_Water
+  { chip: NWSE, block: 0, creature: 0 }, // Block_Static
+  { chip: 0, block: 0, creature: 0 }, // Drowned_Chip
+  { chip: 0, block: 0, creature: 0 }, // Burned_Chip
+  { chip: 0, block: 0, creature: 0 }, // Bombed_Chip
+  { chip: 0, block: 0, creature: 0 }, // Exited_Chip
+  { chip: 0, block: 0, creature: 0 }, // Exit_Extra_1
+  { chip: 0, block: 0, creature: 0 }, // Exit_Extra_2
+  { chip: 0, block: 0, creature: 0 }, // Overlay_Buffer
+  { chip: 0, block: 0, creature: 0 }, // Floor_Reserved2
+  { chip: 0, block: 0, creature: 0 }, // Floor_Reserved1
+];
+
+/* Flags for canmakemove(). MS-specific — do not confuse with Lynx's own
+ * CMM_* constants, which use the same names for entirely different flag
+ * meanings. Including CMM_NOLEAVECHECK in a call to canmakemove()
+ * indicates that the tile the creature is moving out of is automatically
+ * presumed to permit such movement. CMM_NOEXPOSEWALLS causes blue and
+ * hidden walls to remain unexposed. CMM_CLONECANTBLOCK means that the
+ * creature will not be prevented from moving by an identical creature
+ * standing in the way. CMM_NOPUSHING prevents Chip from pushing blocks
+ * inside this function. CMM_TELEPORTPUSH indicates to the block-pushing
+ * logic that Chip is teleporting. This prevents a stack of two blocks
+ * from being treated as a single block, and allows Chip to push a
+ * slipping block away from him. CMM_NOFIRECHECK causes bugs and walkers
+ * to not avoid fire. Finally, CMM_NODEFERBUTTONS causes buttons pressed
+ * by pushed blocks to take effect immediately. (mslogic.c:924-944)
+ */
+const CMM_NOLEAVECHECK = 0x0001;
+const CMM_NOEXPOSEWALLS = 0x0002;
+const CMM_CLONECANTBLOCK = 0x0004;
+const CMM_NOPUSHING = 0x0008;
+const CMM_TELEPORTPUSH = 0x0010;
+const CMM_NOFIRECHECK = 0x0020;
+const CMM_NODEFERBUTTONS = 0x0040;
 
 export class MsLogic implements RulesetLogic {
   readonly ruleset = Ruleset.MS;
@@ -704,6 +840,119 @@ export class MsLogic implements RulesetLogic {
         cr.dir = back(cr.dir); /* OK with SGG, bad for stacked tanks */
       }
     }
+  }
+
+  /*
+   * Maintaining the slip list. (mslogic.c:712-768)
+   */
+
+  /* Add the given creature to the slip list if it is not already on it
+   * (assuming that the given floor is a kind that causes slipping).
+   *
+   * Judgment call on the "Convergence Patch"/"tank reversal patch" chain
+   * below: this is transcribed exactly as the C source's if/else-if chain,
+   * including the two dead-give-away comments ("tank reversal patch",
+   * "new with Convergence Patch") that document real historical bugfixes
+   * to the original game, not simplifications available to this port.
+   * icewallturn()/getSlideDir() are pure functions here (see their design
+   * notes above), so their return values are used directly rather than
+   * expecting them to mutate `cr` in place. (mslogic.c:719-751)
+   */
+  private startFloorMovement(cr: Creature, floor: number, fdir: number): void {
+    let dir = fdir; /* fdir used with tank reversal when stuck on teleporter */
+
+    cr.state &= ~(CS_SLIP | CS_SLIDE);
+
+    if (isice(floor)) {
+      if (fdir === NIL) {
+        /* tank reversal patch */
+        dir = this.icewallturn(floor, cr.dir);
+      }
+    } else if (isslide(floor)) {
+      dir = this.getSlideDir(floor);
+    } else if (floor === Tile.Teleport) {
+      if (fdir === NIL) dir = cr.dir; /* tank reversal patch */
+    } else if (floor === Tile.Beartrap && cr.id === Tile.Block) {
+      dir = cr.dir;
+    } else if (cr.id !== Tile.Chip) {
+      /* new with Convergence Patch */
+      return;
+    } else {
+      dir = cr.dir; /* new with Convergence Patch */
+    }
+
+    if (cr.id === Tile.Chip) {
+      /* changed with Convergence Patch */
+      /* cr->state |= isslide(floor) ? CS_SLIDE : CS_SLIP; */
+      cr.state |= isice(floor) || (floor === Tile.Teleport && dir !== NIL) ? CS_SLIP : CS_SLIDE;
+      this.prependToSlipList(cr, dir);
+      cr.dir = dir;
+      this.updateCreature(cr);
+    } else {
+      cr.state |= CS_SLIP;
+      cr.frame = 0; /* safety with Tank Top Glitch */
+      this.appendToSlipList(cr, dir);
+    }
+  }
+
+  /* Remove the given creature from the slip list. (mslogic.c:755-758) */
+  private endFloorMovement(cr: Creature): void {
+    cr.state &= ~(CS_SLIP | CS_SLIDE);
+    this.removeFromSlipList(cr);
+  }
+
+  /* Clean out deadwood entries in the slip list. Walks `this.slips`
+   * backward because endFloorMovement()/removeFromSlipList() mutates the
+   * array by removing entries; a forward walk would skip entries after a
+   * removal shifts the remaining ones down. (mslogic.c:762-768)
+   */
+  private updateSlipList(): void {
+    for (let n = this.slips.length - 1; n >= 0; --n) {
+      const slip = this.slips[n];
+      if (slip && !(slip.cr.state & (CS_SLIP | CS_SLIDE))) {
+        this.endFloorMovement(slip.cr);
+      }
+    }
+  }
+
+  /* Move a block at the given position forward in the given direction.
+   * Returns FALSE (0) if the block cannot be pushed. (mslogic.c:949-986)
+   */
+  private pushBlock(pos: number, dir: number, flags: number): number {
+    const cr = this.lookupBlock(pos);
+    if (!cr) {
+      console.warn(
+        `${this.state.currenttime}: attempt to push disembodied block!`,
+      );
+      return 0;
+    }
+    const slipping = cr.state & (CS_SLIP | CS_SLIDE); /* accounting */
+    if (cr.state & (CS_SLIP | CS_SLIDE)) {
+      const slipdir = this.getSlipDir(cr);
+      if (dir === slipdir || dir === back(slipdir)) {
+        if (!(flags & CMM_TELEPORTPUSH)) {
+          return 0;
+        }
+      }
+    }
+
+    if (
+      !(flags & CMM_TELEPORTPUSH) &&
+      this.state.cellAt(pos).bot.id === Tile.Block_Static
+    )
+      this.state.cellAt(pos).bot.id = Tile.Empty;
+    if (!(flags & CMM_NODEFERBUTTONS)) cr.state |= CS_DEFERPUSH;
+    const r = this.advanceCreature(cr, dir);
+    if (!(flags & CMM_NODEFERBUTTONS)) cr.state &= ~CS_DEFERPUSH;
+    if (!r) {
+      cr.state &= ~(CS_SLIP | CS_SLIDE);
+      if (slipping) {
+        /* new MSCC-like accounting */
+        this.slipperCount--;
+        this.removeFromSlipList(cr);
+      }
+    }
+    return r;
   }
 
   /*
