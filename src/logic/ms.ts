@@ -93,6 +93,7 @@ import {
   diridx,
   EAST,
   isdoor,
+  isfloor,
   left,
   MOUSERANGE,
   MOUSERANGEMIN,
@@ -110,8 +111,11 @@ import {
   SND_ITEM_COLLECTED,
   SND_SOCKET_OPENED,
   SND_TELEPORTING,
+  SND_TIME_LOW,
+  SND_TIME_OUT,
   SND_WATER_SPLASH,
   SOUTH,
+  TICKS_PER_SECOND,
   WEST,
   crtile,
   creatureid,
@@ -124,7 +128,7 @@ import {
   right,
   Tile,
 } from "../constants";
-import { GameState } from "../state";
+import { GameState, SF_BADTILES, SF_NOANIMATION, SF_SHOWHINT } from "../state";
 import type { Creature, MapTile } from "../types";
 import type { RulesetLogic } from "./ruleset";
 
@@ -2061,15 +2065,305 @@ export class MsLogic implements RulesetLogic {
     }
   }
 
+  /*
+   * The functions provided by the gamelogic struct. (mslogic.c:2139-2416)
+   */
+
+  /* SF_SHOWHINT flag accessors, mirroring lynx.ts's own showHint()/
+   * hideHint() helpers (lxlogic.c:109-110 equivalent).
+   */
+  private showHint(): void {
+    this.state.statusflags |= SF_SHOWHINT;
+  }
+
+  private hideHint(): void {
+    this.state.statusflags &= ~SF_SHOWHINT;
+  }
+
+  /* Actions and checks that occur at the start of a tick. The
+   * `#ifndef NDEBUG` block (debug commands, cheat-code handling,
+   * verifymap()/dumpmap()) is intentionally excluded from this port, per
+   * the convention established for every prior layer. (mslogic.c:2139-2221,
+   * minus the NDEBUG block)
+   */
+  private initialHousekeeping(): void {
+    if (this.state.currenttime === 0) {
+      this.lastStepping = this.state.stepping;
+    }
+
+    if (!(this.state.currenttime & 3)) {
+      for (let n = 1; n < this.state.creatures.length; ++n) {
+        const cr = this.state.creatures[n]!;
+        if (cr.state & CS_TURNING) {
+          cr.state &= ~(CS_TURNING | CS_HASMOVED);
+          this.updateCreature(cr);
+        }
+      }
+      ++this.state.msstate.chipwait;
+      if (this.state.msstate.chipwait > 3) {
+        this.state.msstate.chipwait = 3;
+        const chip = this.getChip();
+        if (chip.dir !== NIL) /* Convergence Glitch patch (a) */
+          chip.dir = SOUTH;
+        this.updateCreature(chip);
+      }
+    }
+  }
+
+  /* Actions and checks that occur at the end of a tick. A genuine no-op
+   * in the C source; kept as an empty method for structural parity with
+   * advanceGame()'s call site, matching the established convention from
+   * Lynx's equivalent no-op. (mslogic.c:2225-2227)
+   */
+  private finalHousekeeping(): void {
+    return;
+  }
+
+  /* Update the display-position fields ahead of rendering. Simpler than
+   * Lynx's equivalent prepareDisplay(): MS has no moving-based sub-tile
+   * animation adjustment here, just the static position-plus-offset
+   * computation. (mslogic.c:2229-2240)
+   */
+  private prepareDisplay(): void {
+    const pos = this.chipPos();
+    if (this.state.cellAt(pos).bot.id === Tile.HintButton) this.showHint();
+    else this.hideHint();
+
+    this.state.xviewpos =
+      (pos % CXGRID) * 8 + this.state.msstate.xviewoffset * 8;
+    /* CYGRID here (not CXGRID) matches mslogic.c:2239 literally; the two
+     * constants happen to have the same value (32), so this is harmless,
+     * but it is transcribed exactly as written rather than "fixed". */
+    this.state.yviewpos =
+      Math.floor(pos / CYGRID) * 8 + this.state.msstate.yviewoffset * 8;
+  }
+
+  /* Initialize the gamestate structure to the state at the beginning of
+   * the level. (mslogic.c:2252-2338)
+   */
   initGame(): boolean {
-    throw new Error("MsLogic.initGame: not yet implemented");
+    this.state.statusflags &= ~SF_BADTILES;
+    this.state.statusflags |= SF_NOANIMATION;
+
+    for (let pos = 0; pos < CXGRID * CYGRID; ++pos) {
+      const cell = this.state.cellAt(pos);
+      if (
+        isfloor(cell.top.id) ||
+        creatureid(cell.top.id) === Tile.Chip ||
+        creatureid(cell.top.id) === Tile.Block
+      ) {
+        if (
+          cell.bot.id === Tile.Teleport ||
+          cell.bot.id === Tile.SwitchWall_Open ||
+          cell.bot.id === Tile.SwitchWall_Closed
+        ) {
+          cell.bot.state |= FS_BROKEN;
+        }
+      }
+    }
+
+    const chip = this.allocateCreature();
+    chip.pos = 0;
+    chip.id = Tile.Chip;
+    chip.dir = SOUTH;
+    this.addToCreatureList(chip);
+
+    for (let n = 0; n < this.state.crlistcount; ++n) {
+      const pos = this.state.crlist[n]!;
+      if (pos < 0 || pos >= CXGRID * CYGRID) {
+        console.warn(
+          `invalid creature location (${pos % CXGRID} ${Math.floor(pos / CXGRID)})`,
+        );
+        continue;
+      }
+      const cell = this.state.cellAt(pos);
+      if (!iscreature(cell.top.id)) {
+        console.warn(
+          `no creature at location (${pos % CXGRID} ${Math.floor(pos / CXGRID)})`,
+        );
+        continue;
+      }
+      if (
+        creatureid(cell.top.id) !== Tile.Block &&
+        cell.bot.id !== Tile.CloneMachine
+      ) {
+        const cr = this.allocateCreature();
+        cr.pos = pos;
+        cr.id = creatureid(cell.top.id);
+        cr.dir = creaturedirid(cell.top.id);
+        this.addToCreatureList(cr);
+        if (iscreature(cell.bot.id) && creatureid(cell.bot.id) === Tile.Chip) {
+          chip.pos = pos;
+          chip.dir = creaturedirid(cell.bot.id);
+        }
+      }
+      cell.top.state |= FS_MARKER;
+    }
+    for (let pos = 0; pos < CXGRID * CYGRID; ++pos) {
+      const cell = this.state.cellAt(pos);
+      if (cell.top.state & FS_MARKER) {
+        cell.top.state &= ~FS_MARKER;
+      } else if (
+        iscreature(cell.top.id) &&
+        creatureid(cell.top.id) === Tile.Chip
+      ) {
+        chip.pos = pos;
+        chip.dir = creaturedirid(cell.bot.id);
+      }
+    }
+
+    /* mslogic.c:2313-2314 (`dummycrlist.id = 0; state->creatures =
+     * &dummycrlist;`) is deliberately NOT ported here. In the original C
+     * program this line is a harmless compatibility no-op: MS's real
+     * active-creature bookkeeping lives in its own private module-static
+     * `creatures[]` array (never `gamestate.creatures`), so overwriting
+     * `state->creatures` with a dummy single-element list only guards
+     * against generic/display code elsewhere that assumes Lynx's
+     * convention that `gamestate.creatures` IS the real list. But THIS
+     * port's layer-1 design decision mapped MS's active-creature list
+     * directly onto `GameState.creatures` — `this.state.creatures` IS the
+     * real, actively-used list this very function just built up via
+     * addToCreatureList(). Porting the line literally would destroy that
+     * list, replacing it with a dummy single entry: catastrophic here,
+     * even though it's inert in the original C. So this line is skipped
+     * outright, per this dispatch's required deviation. */
+    this.state.initrndslidedir = NORTH;
+
+    this.state.keys[0] = 0;
+    this.state.keys[1] = 0;
+    this.state.keys[2] = 0;
+    this.state.keys[3] = 0;
+    this.state.boots[0] = 0;
+    this.state.boots[1] = 0;
+    this.state.boots[2] = 0;
+    this.state.boots[3] = 0;
+
+    for (let n = 0; n < this.state.trapcount; ++n) {
+      const trap = this.state.traps[n]!;
+      if (
+        trap.to === this.chipPos() ||
+        this.state.cellAt(trap.to).top.id === Tile.Block_Static ||
+        this.isTrapButtonDown(trap.from)
+      ) {
+        this.springTrap(trap.from);
+      }
+    }
+
+    this.state.msstate.chipwait = 0;
+    this.state.msstate.completed = 0;
+    this.state.msstate.chipstatus = ChipStatus.CHIP_OKAY;
+    this.state.msstate.controllerdir = NIL;
+    this.state.msstate.lastslipdir = NIL;
+    this.state.stepping = this.lastStepping;
+    this.cancelGoal();
+    this.state.msstate.xviewoffset = 0;
+    this.state.msstate.yviewoffset = 0;
+
+    this.prepareDisplay();
+    return true;
   }
 
+  /* Advance the game state by one tick. The C source's `goto done;` early
+   * exits are restructured as a labeled block with `break done` — every
+   * such exit still falls through to the shared `finalHousekeeping()`/
+   * `prepareDisplay()` epilogue before returning `r`, mirroring the C
+   * control flow exactly. The lone exception is the CHIP_OUTOFTIME
+   * timeout check below, which in the C source is a bare `return -1;`
+   * (not a `goto done;`) — an inconsistency in the original source that
+   * is preserved here rather than "fixed": that one early return skips
+   * the epilogue entirely. (mslogic.c:2342-2405)
+   */
   advanceGame(): number {
-    throw new Error("MsLogic.advanceGame: not yet implemented");
+    let r = 0;
+
+    this.state.timeoffset = -1;
+    this.initialHousekeeping();
+
+    this.slipperCount = this.slips.length;
+    if (this.getChip().state & (CS_SLIP | CS_SLIDE)) /* new accounting */
+      this.slipperCount--;
+
+    done: {
+      if (this.state.currenttime && !(this.state.currenttime & 1)) {
+        this.state.msstate.controllerdir = NIL;
+        for (let n = 0; n < this.state.creatures.length; ++n) {
+          const cr = this.state.creatures[n]!;
+          if (
+            !cr.hidden &&
+            cr.id !== Tile.Chip &&
+            !(this.state.currenttime & 3) &&
+            this.state.msstate.chipstatus === ChipStatus.CHIP_SQUISHED &&
+            !this.state.msstate.completed
+          )
+            this.state.msstate.chipstatus = ChipStatus.CHIP_SQUISHED_DEATH; /* Squish patch */
+          if (cr.hidden || cr.state & CS_CLONING || cr.id === Tile.Chip)
+            continue;
+          this.chooseMove(cr);
+          if (cr.tdir !== NIL) this.advanceCreature(cr, cr.tdir);
+        }
+        r = this.checkForEnding();
+        if (r) break done;
+      }
+
+      if (this.state.currenttime && !(this.state.currenttime & 1)) {
+        this.floorMovements();
+        r = this.checkForEnding();
+        if (r) break done;
+      }
+      this.updateSlipList();
+
+      this.state.timeoffset = 0;
+      if (this.state.timelimit) {
+        if (this.state.currenttime >= this.state.timelimit) {
+          this.state.msstate.chipstatus = ChipStatus.CHIP_OUTOFTIME;
+          this.addSoundEffect(SND_TIME_OUT);
+          return -1; /* bare `return -1;` in the C source — bypasses the
+                      * finalHousekeeping()/prepareDisplay() epilogue below,
+                      * unlike every other early exit in this function. */
+        } else if (
+          this.state.timelimit - this.state.currenttime <=
+            15 * TICKS_PER_SECOND &&
+          this.state.currenttime % TICKS_PER_SECOND === 0
+        ) {
+          this.addSoundEffect(SND_TIME_LOW);
+        }
+      }
+
+      const chip = this.getChip();
+      this.chooseMove(chip);
+      if (chip.tdir !== NIL) {
+        this.advanceCreature(chip, chip.tdir); /* Squish patch, TW checked this?! */
+        r = this.checkForEnding(); /* TW checks advanceCreature() status */
+        if (r) break done; /* guess it's a remnant of Chip starting on exit? */
+        chip.state |= CS_HASMOVED;
+      }
+      this.updateSlipList();
+      this.createClones();
+    }
+
+    this.finalHousekeeping();
+    this.prepareDisplay();
+    return r;
   }
 
+  /* Clean up after the game is done. The C source's resetcreaturepool()/
+   * resetcreaturelist()/resetblocklist()/resetsliplist() calls reset the
+   * C-only pool arena and per-game arrays for reuse by the next game. This
+   * port has no pool arena (JS garbage-collects), and each MsLogic
+   * instance is constructed fresh per Game (the current Game/RulesetLogic
+   * architecture never reuses an instance across games — see lynx.ts's
+   * equivalent endGame(), which is also a bare `return true`). So there is
+   * no strict need to clear anything here. `this.blocks`/`this.slips` are
+   * cleared anyway for safety/consistency, since doing so costs nothing
+   * and matches the C source's intent even though the exact mechanism
+   * differs; `this.state.creatures` is deliberately left untouched, since
+   * (per the design note in initGame() above) it IS the real, live
+   * creature list in this port, not a C-only arena to reset.
+   * (mslogic.c:2409-2416)
+   */
   endGame(): boolean {
-    throw new Error("MsLogic.endGame: not yet implemented");
+    this.resetBlockList();
+    this.resetSlipList();
+    return true;
   }
 }
