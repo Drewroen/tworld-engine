@@ -14,11 +14,13 @@ describe("Prng (LCG)", () => {
     for (let i = 0; i < 1000; i++) expect(p.random4()).toBeGreaterThanOrEqual(0);
   });
   it("matches a known LCG sub-sequence", () => {
-    // Golden values captured from random.c with restartprng(seed=1):
-    // (fill from oracle in Task 7; placeholder asserts structure until then)
+    // Golden values captured from the real, unmodified C `random.c` via the
+    // Task 7 oracle harness (tools/oracle/prng-dump.c), calling
+    // restartprng(&gen, 1) and printing 8 successive random4() outputs.
+    const golden = [2, 0, 1, 2, 3, 0, 2, 0];
     const p = new Prng(1); p.restart(1);
-    const v = p.random4();
-    expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThan(4);
+    const seq = Array.from({ length: 8 }, () => p.random4());
+    expect(seq).toEqual(golden);
   });
   it("reset() with no seed throws if the shared sequence was never seeded", async () => {
     // Use a fresh module instance (distinct query string) so the module-level
