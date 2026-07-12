@@ -8,9 +8,7 @@
 // random.c:15 — `static unsigned long lastvalue = 0x80000000UL;` — the
 // module-level "shared sequence" value chained across all shared-mode
 // generators. Kept out-of-range (> 0x7FFFFFFF) initially, mirroring the C
-// sentinel that random.c:52-53 uses to detect "never seeded"; exposed via
-// resetSharedSequence() so tests can isolate the shared sequence instead of
-// relying on wall-clock seeding (which this port deliberately omits).
+// sentinel that random.c:52-53 uses to detect "never seeded".
 let lastValue = 0x80000000;
 
 // random.c:17-20
@@ -20,11 +18,6 @@ let lastValue = 0x80000000;
 // }
 function nextValue(value: number): number {
   return ((Math.imul(value, 1103515245) >>> 0) + 12345) & 0x7fffffff;
-}
-
-/** Reset the module-level shared sequence (random.c:15's `lastvalue`). Exposed for test isolation. */
-export function resetSharedSequence(seed: number): void {
-  lastValue = seed & 0x7fffffff;
 }
 
 export class Prng {
@@ -48,13 +41,17 @@ export class Prng {
   //
   // This port omits time()-based seeding: determinism requires an explicitly
   // injected seed. If no seed is supplied and the shared sequence has never
-  // been seeded, the shared sequence is seeded with 0 (deterministic
-  // fallback in place of time(NULL)).
+  // been seeded, throw rather than silently substituting an arbitrary
+  // fallback value — an unseeded call here almost always indicates a seed
+  // failed to get threaded through somewhere upstream.
   reset(seed?: number): void {
     if (seed !== undefined) {
       lastValue = seed & 0x7fffffff;
     } else if (lastValue > 0x7fffffff) {
-      lastValue = nextValue(nextValue(nextValue(nextValue(0))));
+      throw new Error(
+        "Prng.reset() called with no seed, but the shared sequence has never been seeded. " +
+          "Pass an explicit seed (determinism requires an injected seed).",
+      );
     }
     this.value = this.initial = lastValue;
     this.shared = true;
