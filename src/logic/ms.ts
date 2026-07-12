@@ -103,6 +103,8 @@ import {
   SND_BOOTS_STOLEN,
   SND_BUTTON_PUSHED,
   SND_CANT_MOVE,
+  SND_CHIP_LOSES,
+  SND_CHIP_WINS,
   SND_DOOR_OPENED,
   SND_IC_COLLECTED,
   SND_ITEM_COLLECTED,
@@ -1893,6 +1895,170 @@ export class MsLogic implements RulesetLogic {
     if (cr.id === Tile.Chip) this.handleButtons();
 
     return 1;
+  }
+
+  /* Determine whether the game has ended, one way or the other. Returns
+   * -1 if Chip has lost, +1 if Chip has won, 0 otherwise. Note the Squish
+   * patch exception: a Chip who is merely CHIP_SQUISHED (but not yet
+   * finalized as CHIP_SQUISHED_DEATH) is not treated as a loss here.
+   * (mslogic.c:1895-1905)
+   */
+  private checkForEnding(): number {
+    if (
+      this.state.msstate.chipstatus !== ChipStatus.CHIP_OKAY &&
+      this.state.msstate.chipstatus !== ChipStatus.CHIP_SQUISHED
+    ) {
+      this.addSoundEffect(SND_CHIP_LOSES); /* Squish patch */
+      return -1;
+    }
+    if (this.state.msstate.completed) {
+      this.addSoundEffect(SND_CHIP_WINS);
+      return 1;
+    }
+    return 0;
+  }
+
+  /*
+   * Automatic activities.
+   */
+
+  /* Execute all forced moves for Chip on the slip list. (Note the use of
+   * the savedcount variable, which is how slide delay is implemented.)
+   * Split from the non-Chip half below; see design notes accompanying
+   * this dispatch. (mslogic.c:1911-1958)
+   */
+  private floorMovementsOfChip(): void {
+    for (let n = 0; n < this.slips.length; ++n) {
+      const slip = this.slips[n];
+      if (!slip) continue;
+      const cr = slip.cr;
+      if (!(slip.cr.state & (CS_SLIP | CS_SLIDE))) continue;
+      let slipdir = slip.dir;
+      if (slipdir === NIL && cr.id === Tile.Chip) {
+        /* Convergence Patch */
+        this.state.cellAt(cr.pos).top.id = crtile(Tile.Chip, NORTH);
+      }
+      if (slipdir === NIL) continue;
+      if (cr.id !== Tile.Chip) continue; /* new, non-Chip ignored */
+      this.state.msstate.lastslipdir = slipdir;
+      let ac = this.advanceCreature(cr, slipdir); /* useful to have ac */
+      if (ac) {
+        cr.state &= ~CS_HASMOVED;
+      } else {
+        const floor = this.state.cellAt(cr.pos).bot.id;
+        if (isslide(floor)) {
+          cr.state &= ~CS_HASMOVED;
+        } else if (isice(floor)) {
+          slipdir = this.icewallturn(floor, back(slipdir));
+          this.state.msstate.lastslipdir = slipdir;
+          ac = this.advanceCreature(cr, slipdir); /* again useful with ac */
+          if (ac) cr.state &= ~CS_HASMOVED;
+        } else if (floor === Tile.Teleport || floor === Tile.Block_Static) {
+          slipdir = back(slipdir);
+          this.state.msstate.lastslipdir = slipdir;
+          if (this.advanceCreature(cr, slipdir)) cr.state &= ~CS_HASMOVED;
+        }
+        if (cr.state & (CS_SLIP | CS_SLIDE)) {
+          this.endFloorMovement(cr);
+          this.startFloorMovement(
+            cr,
+            this.state.cellAt(cr.pos).bot.id,
+            NIL,
+          ); /* 3rd argument with tank reversal patch */
+        }
+      }
+      if (this.checkForEnding()) return;
+    }
+  }
+
+  /* Execute all forced moves for blocks and monsters on the slip list.
+   * Split from the Chip-only half above. The `n`/`advance` loop mirrors
+   * the C source's `for (n = 0; n < slipcount;)` with no auto-increment
+   * clause: every path through the loop body explicitly decides whether
+   * to advance `n`. (mslogic.c:1960-2013)
+   */
+  private floorMovementsOfBlocksAndMonsters(): void {
+    let advance = 0;
+
+    for (let n = 0; n < this.slips.length; ) {
+      const oldMsccSlippers = this.slipperCount;
+      const slip = this.slips[n];
+      if (!slip) {
+        n++;
+        continue;
+      }
+      const cr = slip.cr;
+      if (cr.id === Tile.Chip) {
+        /* new splitting */
+        n++;
+        continue;
+      }
+      if (advance) {
+        advance--;
+        n++;
+        continue;
+      }
+      if (!(slip.cr.state & (CS_SLIP | CS_SLIDE))) {
+        n++;
+        continue;
+      }
+      let slipdir = slip.dir;
+      const origdir = slipdir; /* tank reversal patch */
+      if (slipdir === NIL) {
+        n++;
+        continue;
+      }
+      cr.frame = cr.dir; /* Tank Top Glitch */
+      let ac = this.advanceCreature(cr, slipdir); /* useful to have ac */
+      if (!ac) {
+        const floor = this.state.cellAt(cr.pos).bot.id;
+        if (isice(floor)) {
+          slipdir = this.icewallturn(floor, back(slipdir));
+          ac = this.advanceCreature(cr, slipdir); /* again useful with ac */
+        }
+        if (cr.state & (CS_SLIP | CS_SLIDE)) {
+          this.endFloorMovement(cr);
+          this.slipperCount--; /* new MSCC accounting */
+          this.startFloorMovement(
+            cr,
+            this.state.cellAt(cr.pos).bot.id,
+            ac ? NIL : origdir,
+          ); /* 3rd argument with tank reversal patch */
+        }
+      }
+      if (cr.state & CS_SLIP && ac) cr.state |= CS_SLIDE; /* Tank Top Glitch */
+      cr.frame = 0; /* Tank Top Glitch */
+      if (this.checkForEnding()) return;
+      if (this.slipperCount === oldMsccSlippers) advance++;
+    }
+  }
+
+  /* Orchestrates the two slip-list-processing halves above, plus the
+   * Squish patch's final death-finalization step. (mslogic.c:2015-2024)
+   */
+  private floorMovements(): void {
+    this.floorMovementsOfChip();
+    this.updateSlipList(); /* remove deadwood */
+    /* TSG stuff, not yet included */
+    if (!this.checkForEnding())
+      /* Squish patch (maybe was oversight?) */
+      this.floorMovementsOfBlocksAndMonsters();
+    if (
+      !this.state.msstate.completed &&
+      this.state.msstate.chipstatus === ChipStatus.CHIP_SQUISHED
+    )
+      this.state.msstate.chipstatus = ChipStatus.CHIP_SQUISHED_DEATH;
+  }
+
+  /* Finalize clone creation for the tick: clear the transient
+   * "still cloning" marker on any creature that has it set. The actual
+   * cloning/spawning already happened earlier via awakenCreature()/
+   * activateCloner(). (mslogic.c:2027-2033)
+   */
+  private createClones(): void {
+    for (const cr of this.state.creatures) {
+      if (cr.state & CS_CLONING) cr.state &= ~CS_CLONING;
+    }
   }
 
   initGame(): boolean {
