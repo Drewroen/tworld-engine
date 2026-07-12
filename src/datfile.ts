@@ -42,7 +42,7 @@ function parseLevel(data: Uint8Array): GameSetup {
         pos += 2;
 
         const dataend = data.length;
-        while (pos + 2 <= dataend) {
+        while (pos + 2 < dataend) {
           const fieldId = data[pos] ?? 0;
           let length = data[pos + 1] ?? 0;
           pos += 2;
