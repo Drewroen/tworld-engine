@@ -81,10 +81,51 @@
 //   `removecreature`/analogous bookkeeping hasn't been ported yet) is
 //   better positioned to confirm this is still accurate and add it then.
 
-import { NIL, Ruleset, Tile } from "../constants";
+import {
+  back,
+  CXGRID,
+  CYGRID,
+  EAST,
+  NIL,
+  NORTH,
+  Ruleset,
+  SOUTH,
+  WEST,
+  crtile,
+  creatureid,
+  creaturedirid,
+  iskey,
+  isboots,
+  iscreature,
+  right,
+  Tile,
+} from "../constants";
 import { GameState } from "../state";
-import type { Creature } from "../types";
+import type { Creature, MapTile } from "../types";
 import type { RulesetLogic } from "./ruleset";
+
+/* Floor state flags. MS-specific — do not confuse with Lynx's own FS_*
+ * constants, which use the same names for entirely different bit meanings.
+ * (mslogic.c:385-389)
+ */
+const FS_BUTTONDOWN = 0x01; /* button press is deferred */
+const FS_CLONING = 0x02; /* clone machine is activated */
+const FS_BROKEN = 0x04; /* teleport/toggle wall doesn't work */
+const FS_HASMUTANT = 0x08; /* beartrap contains mutant block */
+const FS_MARKER = 0x10; /* marker used during initialization */
+
+/* Creature state flags. MS-specific — do not confuse with Lynx's own CS_*
+ * constants, which use the same names for entirely different bit meanings.
+ * (mslogic.c:550-557)
+ */
+const CS_RELEASED = 0x01; /* can leave a beartrap */
+const CS_CLONING = 0x02; /* cannot move this tick */
+const CS_HASMOVED = 0x04; /* already used current move */
+const CS_TURNING = 0x08; /* is turning around */
+const CS_SLIP = 0x10; /* is on the slip list */
+const CS_SLIDE = 0x20; /* is on the slip list but can move */
+const CS_DEFERPUSH = 0x40; /* button pushes will be delayed */
+const CS_MUTANT = 0x80; /* block is mutant, looks like Chip */
 
 /* A list of ways for Chip to lose. (mslogic.c:23-28)
  * Includes the two Squish-patch additions (CHIP_SQUISHED/
@@ -341,6 +382,328 @@ export class MsLogic implements RulesetLogic {
     const n = this.slips.findIndex((slip) => slip.cr === cr);
     if (n === -1) return;
     this.slips.splice(n, 1);
+  }
+
+  /*
+   * Simple floor functions. (mslogic.c:379-542)
+   */
+
+  /* Translate a slide floor into the direction it points in. In the case
+   * of a random slide floor, a new direction is selected. Note: this uses
+   * the MAIN prng's random4() directly, unlike Lynx's random-slide
+   * handling (lastRndSlideDir + right() rotation). (mslogic.c:394-408)
+   */
+  private getSlideDir(floor: number): number {
+    switch (floor) {
+      case Tile.Slide_North:
+        return NORTH;
+      case Tile.Slide_West:
+        return WEST;
+      case Tile.Slide_South:
+        return SOUTH;
+      case Tile.Slide_East:
+        return EAST;
+      case Tile.Slide_Random:
+        return 1 << this.state.mainprng.random4();
+      default:
+        return NIL;
+    }
+  }
+
+  /* Alter a creature's direction if they are at an ice wall. Pure
+   * function — unlike Lynx's applyIceWallTurn, this does not mutate
+   * anything; the caller is responsible for applying the result.
+   * (mslogic.c:412-424)
+   */
+  private icewallturn(floor: number, dir: number): number {
+    switch (floor) {
+      case Tile.IceWall_Northeast:
+        return dir === SOUTH ? EAST : dir === WEST ? NORTH : dir;
+      case Tile.IceWall_Southwest:
+        return dir === NORTH ? WEST : dir === EAST ? SOUTH : dir;
+      case Tile.IceWall_Northwest:
+        return dir === SOUTH ? WEST : dir === EAST ? NORTH : dir;
+      case Tile.IceWall_Southeast:
+        return dir === NORTH ? EAST : dir === WEST ? SOUTH : dir;
+      default:
+        return dir;
+    }
+  }
+
+  /* Find the location of a bear trap from one of its buttons.
+   * (mslogic.c:428-437)
+   */
+  private trapFromButton(pos: number): number {
+    for (let i = 0; i < this.state.trapcount; ++i) {
+      const trap = this.state.traps[i];
+      if (trap && trap.from === pos) return trap.to;
+    }
+    return -1;
+  }
+
+  /* Find the location of a clone machine from one of its buttons.
+   * (mslogic.c:441-450)
+   */
+  private clonerFromButton(pos: number): number {
+    for (let i = 0; i < this.state.clonercount; ++i) {
+      const cloner = this.state.cloners[i];
+      if (cloner && cloner.from === pos) return cloner.to;
+    }
+    return -1;
+  }
+
+  /* Return the floor tile found at the given location. (mslogic.c:454-465) */
+  private floorAt(pos: number): number {
+    const cell = this.state.cellAt(pos);
+    if (
+      !iskey(cell.top.id) &&
+      !isboots(cell.top.id) &&
+      !iscreature(cell.top.id)
+    )
+      return cell.top.id;
+    if (
+      !iskey(cell.bot.id) &&
+      !isboots(cell.bot.id) &&
+      !iscreature(cell.bot.id)
+    )
+      return cell.bot.id;
+    return Tile.Empty;
+  }
+
+  /* Return a reference to the tile that forms the floor at the given
+   * location, so the caller can mutate it in place (mirroring the C
+   * maptile* pointer). Note the final fallback replicates the C source's
+   * `/* ? *\/`-flagged quirk: it returns the bottom tile reference (not a
+   * synthesized Empty tile), even though the equivalent branch in
+   * floorAt() returns the Empty constant. (mslogic.c:470-481)
+   */
+  private getFloorAt(pos: number): MapTile {
+    const cell = this.state.cellAt(pos);
+    if (
+      !iskey(cell.top.id) &&
+      !isboots(cell.top.id) &&
+      !iscreature(cell.top.id)
+    )
+      return cell.top;
+    if (
+      !iskey(cell.bot.id) &&
+      !isboots(cell.bot.id) &&
+      !iscreature(cell.bot.id)
+    )
+      return cell.bot;
+    return cell.bot; /* ? */
+  }
+
+  /* Return TRUE if the brown button at the given location is currently
+   * held down. (mslogic.c:486-488)
+   */
+  private isTrapButtonDown(pos: number): boolean {
+    return (
+      pos >= 0 &&
+      pos < CXGRID * CYGRID &&
+      this.state.cellAt(pos).top.id !== Tile.Button_Brown
+    );
+  }
+
+  /* Place a new tile at the given location, causing the current upper
+   * tile to become the lower tile. (mslogic.c:493-499)
+   */
+  private pushTile(pos: number, tile: MapTile): void {
+    const cell = this.state.cellAt(pos);
+    cell.bot = cell.top;
+    cell.top = tile;
+  }
+
+  /* Remove the upper tile from the given location, causing the current
+   * lower tile to become uppermost. Returns a snapshot copy of the tile
+   * that was removed. (mslogic.c:504-514)
+   */
+  private popTile(pos: number): MapTile {
+    const cell = this.state.cellAt(pos);
+    const tile: MapTile = { id: cell.top.id, state: cell.top.state };
+    cell.top = cell.bot;
+    cell.bot = { id: Tile.Empty, state: 0 };
+    return tile;
+  }
+
+  /* Return TRUE if a bear trap is currently passable. (mslogic.c:518-527) */
+  private isTrapOpen(pos: number, skipPos: number): boolean {
+    for (let i = 0; i < this.state.trapcount; ++i) {
+      const trap = this.state.traps[i];
+      if (
+        trap &&
+        trap.to === pos &&
+        trap.from !== skipPos &&
+        this.isTrapButtonDown(trap.from)
+      )
+        return true;
+    }
+    return false;
+  }
+
+  /* Flip-flop the state of any toggle walls. (mslogic.c:531-542) */
+  private toggleWalls(): void {
+    for (let pos = 0; pos < CXGRID * CYGRID; ++pos) {
+      const cell = this.state.cellAt(pos);
+      if (
+        (cell.top.id === Tile.SwitchWall_Open ||
+          cell.top.id === Tile.SwitchWall_Closed) &&
+        !(cell.top.state & FS_BROKEN)
+      )
+        cell.top.id ^= Tile.SwitchWall_Open ^ Tile.SwitchWall_Closed;
+      if (
+        (cell.bot.id === Tile.SwitchWall_Open ||
+          cell.bot.id === Tile.SwitchWall_Closed) &&
+        !(cell.bot.state & FS_BROKEN)
+      )
+        cell.bot.id ^= Tile.SwitchWall_Open ^ Tile.SwitchWall_Closed;
+    }
+  }
+
+  /*
+   * Functions that manage the list of entities. (mslogic.c:544-710)
+   */
+
+  /* Return the creature located at pos. Ignores Chip unless includeChip
+   * is true. Return null if no such creature is present. (mslogic.c:562-575)
+   */
+  private lookupCreature(pos: number, includeChip: boolean): Creature | null {
+    for (const cr of this.state.creatures) {
+      if (cr.hidden) continue;
+      if (cr.pos === pos && (cr.id !== Tile.Chip || includeChip)) return cr;
+    }
+    return null;
+  }
+
+  /* Return the block located at pos. If the block in question is not
+   * currently "active", it is automatically added to the block list.
+   *
+   * Judgment call: the C source's `_assert(!"lookupblock() called on
+   * blockless location")` is a debug-only assertion that fires only when
+   * called on a location with no block/Block_Static tile at all. Per the
+   * no-op-assertion convention established for Lynx, this is transcribed
+   * as a thrown Error instead (rather than a silent no-op) since silently
+   * falling through would leave `cr.dir` at its allocateCreature() default
+   * of NIL with no diagnostic, masking a genuine caller bug during
+   * development. (mslogic.c:580-602)
+   */
+  private lookupBlock(pos: number): Creature {
+    for (const block of this.blocks) {
+      if (block.pos === pos && !block.hidden) return block;
+    }
+
+    const cr = this.allocateCreature();
+    cr.id = Tile.Block;
+    cr.pos = pos;
+    const id = this.state.cellAt(pos).top.id;
+    if (id === Tile.Block_Static) {
+      cr.dir = NIL;
+    } else if (creatureid(id) === Tile.Block) {
+      cr.dir = creaturedirid(id);
+    } else {
+      throw new Error("lookupBlock() called on blockless location");
+    }
+
+    return this.addToBlockList(cr);
+  }
+
+  /* Update the given creature's tile on the map to reflect its current
+   * state. (mslogic.c:607-641)
+   */
+  private updateCreature(cr: Creature): void {
+    if (cr.hidden) return;
+    const cell = this.state.cellAt(cr.pos);
+    const tile = cell.top;
+    let id = cr.id;
+    if (id === Tile.Block) {
+      tile.id = Tile.Block_Static;
+      if (cr.state & CS_MUTANT) tile.id = crtile(Tile.Chip, NORTH);
+      return;
+    } else if (id === Tile.Chip) {
+      if (this.state.msstate.chipstatus) {
+        switch (this.state.msstate.chipstatus) {
+          case ChipStatus.CHIP_BURNED:
+            tile.id = Tile.Burned_Chip;
+            return;
+          case ChipStatus.CHIP_DROWNED:
+            tile.id = Tile.Drowned_Chip;
+            return;
+        }
+      } else if (cell.bot.id === Tile.Water) {
+        id = Tile.Swimming_Chip;
+      }
+    }
+
+    let dir = cr.dir;
+    if (cr.state & CS_TURNING) dir = right(dir);
+
+    tile.id = crtile(id, dir);
+    tile.state = 0;
+  }
+
+  /* Add the given creature's tile to the map. (mslogic.c:645-652) */
+  private addCreatureToMap(cr: Creature): void {
+    if (cr.hidden) return;
+    this.pushTile(cr.pos, { id: Tile.Empty, state: 0 });
+    this.updateCreature(cr);
+  }
+
+  /* Enervate an inert creature. (mslogic.c:656-668) */
+  private awakenCreature(pos: number): Creature | null {
+    const tileId = this.state.cellAt(pos).top.id;
+    if (!iscreature(tileId) || creatureid(tileId) === Tile.Chip) return null;
+    const cr = this.allocateCreature();
+    cr.id = creatureid(tileId);
+    cr.dir = creaturedirid(tileId);
+    cr.pos = pos;
+    return cr.id === Tile.Block
+      ? this.addToBlockList(cr)
+      : this.addToCreatureList(cr);
+  }
+
+  /* Mark a creature as dead. (mslogic.c:672-679) */
+  private removeCreature(cr: Creature): void {
+    cr.state &= ~(CS_SLIP | CS_SLIDE);
+    if (cr.id === Tile.Chip) {
+      if (this.state.msstate.chipstatus === ChipStatus.CHIP_OKAY)
+        this.state.msstate.chipstatus = ChipStatus.CHIP_NOTOKAY;
+    } else {
+      cr.hidden = true;
+    }
+  }
+
+  /* Turn around any and all tanks. (A tank that is halfway through the
+   * process of moving at the time is given special treatment.) The
+   * "Tank Top Glitch" and "Spontaneous Generation" handling below are
+   * real, historically-observed original-game quirks being deliberately
+   * preserved, not bugs. (mslogic.c:684-710)
+   */
+  private turnTanks(inMidMove: Creature | null): void {
+    for (const cr of this.state.creatures) {
+      if (cr.hidden || cr.id !== Tile.Tank) continue;
+      cr.dir = back(cr.dir);
+      if (
+        cr.state & CS_SLIP &&
+        !(cr.state & CS_SLIDE) &&
+        cr.frame !== 0 &&
+        cr.moving === 0
+      )
+        cr.dir = back(cr.frame); /* Tank Top Glitch */
+      if (!(cr.state & CS_TURNING)) cr.state |= CS_TURNING | CS_HASMOVED;
+      if (cr === inMidMove) continue;
+      if (creatureid(this.state.cellAt(cr.pos).top.id) === Tile.Tank) {
+        this.updateCreature(cr);
+      } else if (cr.moving !== 0) {
+        /* handle Spontaneous Generation */
+        if (cr.state & CS_TURNING) {
+          /* always TRUE? */
+          cr.state &= ~CS_TURNING;
+          this.updateCreature(cr);
+          cr.state |= CS_TURNING;
+        }
+        cr.dir = back(cr.dir); /* OK with SGG, bad for stacked tanks */
+      }
+    }
   }
 
   /*
