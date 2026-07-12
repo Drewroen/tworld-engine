@@ -362,10 +362,6 @@ export class MsLogic implements RulesetLogic {
     return this.getChip().pos;
   }
 
-  private chipDir(): number {
-    return this.getChip().dir;
-  }
-
   /* possession(obj)/checkpossession(obj) — resolves a tile/object id to the
    * player's inventory slot for it (keys/boots), as an lvalue in C.
    * Ported as a get/set pair over the resolved slot, mirroring the pattern
@@ -462,11 +458,6 @@ export class MsLogic implements RulesetLogic {
       hidden: false,
       moving: 0,
     };
-  }
-
-  /* Empty the list of active creatures. (mslogic.c:260-262) */
-  private resetCreatureList(): void {
-    this.state.creatures.length = 0;
   }
 
   /* Append the given creature to the end of the creature list.
