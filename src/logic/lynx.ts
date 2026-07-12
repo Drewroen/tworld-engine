@@ -69,6 +69,12 @@ import {
   isice,
   isslide,
   isdoor,
+  isfloor,
+  iscreature,
+  ismsspecial,
+  crtile,
+  creatureid,
+  creaturedirid,
   directionalcmd,
   SND_SKATING_FORWARD,
   SND_SKATING_TURN,
@@ -94,7 +100,7 @@ import {
   SND_TRAP_ENTERED,
   SND_BUTTON_PUSHED,
 } from "../constants";
-import { GameState } from "../state";
+import { GameState, SF_BADTILES, SF_INVALID, SF_SHOWHINT } from "../state";
 import type { Creature } from "../types";
 import type { RulesetLogic } from "./ruleset";
 
@@ -1616,20 +1622,420 @@ export class LynxLogic implements RulesetLogic {
   }
 
   /*
-   * Lifecycle (RulesetLogic). Full implementations land in a later
-   * sub-step (housekeeping + lifecycle layer); these are stubs so the
-   * class satisfies the interface and the file type-checks.
+   * The housekeeping + lifecycle layer. (lxlogic.c:1612-2014)
    */
 
+  /* SF_SHOWHINT flag accessors. (lxlogic.c:109-110) */
+  private showHint(): void {
+    this.state.statusflags |= SF_SHOWHINT;
+  }
+
+  private hideHint(): void {
+    this.state.statusflags &= ~SF_SHOWHINT;
+  }
+
+  /* SF_INVALID flag accessors. (lxlogic.c:111-112) */
+  private markInvalid(): void {
+    this.state.statusflags |= SF_INVALID;
+  }
+
+  private isMarkedInvalid(): boolean {
+    return (this.state.statusflags & SF_INVALID) !== 0;
+  }
+
+  /* Actions and checks that occur at the start of every tick.
+   * (lxlogic.c:1612-1701 — minus the #ifndef NDEBUG debug/cheat blocks,
+   * which are intentionally excluded from this port.)
+   */
+  private initialHousekeeping(): void {
+    if (this.state.currenttime === 0) {
+      this.lastRndSlideDir = this.state.initrndslidedir;
+      this.lastStepping = this.state.stepping;
+    }
+
+    const chip = this.getChip();
+    if (chip.id === Tile.Pushing_Chip) {
+      chip.id = Tile.Chip;
+    }
+
+    if (!this.state.lxstate.endgametimer) {
+      if (this.state.lxstate.completed) {
+        this.startEndGameTimer();
+        this.state.timeoffset = 1;
+      } else if (this.state.timelimit && this.state.currenttime >= this.state.timelimit) {
+        this.removeChip(ChipStatus.CHIP_OUTOFTIME, null);
+      }
+    }
+
+    for (let i = 0; i < this.crEndIndex; i++) {
+      const cr = this.state.creatures[i];
+      if (!cr) continue;
+      if (cr !== chip && cr.hidden) continue;
+      if (cr.state & CS_REVERSE) {
+        cr.state &= ~CS_REVERSE;
+        if (cr.moving <= 0) {
+          cr.dir = back(cr.dir);
+        }
+      }
+    }
+    for (let i = 0; i < this.crEndIndex; i++) {
+      const cr = this.state.creatures[i];
+      if (!cr) continue;
+      if (cr.state & CS_PUSHED) {
+        if (cr.hidden || cr.moving <= 0) {
+          this.stopSoundEffect(SND_BLOCK_MOVING);
+          cr.state &= ~CS_PUSHED;
+        }
+      }
+    }
+
+    if (this.state.lxstate.togglestate) {
+      for (let pos = 0; pos < CXGRID * CYGRID; pos++) {
+        const id = this.floorAt(pos);
+        if (id === Tile.SwitchWall_Open || id === Tile.SwitchWall_Closed) {
+          this.state.cellAt(pos).top.id ^= this.state.lxstate.togglestate;
+        }
+      }
+      this.state.lxstate.togglestate = 0;
+    }
+
+    this.state.lxstate.chiptopos = -1;
+    this.state.lxstate.chiptocr = null;
+  }
+
+  /* Actions and checks that occur at the end of every tick.
+   * (lxlogic.c:1703-1708 — a no-op in the original; kept as a real method
+   * for structural parity with advanceGame()'s call sequence.)
+   */
+  private finalHousekeeping(): void {
+    return;
+  }
+
+  /* Set the state fields specifically used to produce the output.
+   * (lxlogic.c:1710-1761)
+   */
+  private prepareDisplay(): void {
+    const chip = this.getChip();
+    const floor = this.floorAt(chip.pos);
+
+    this.state.xviewpos = (chip.pos % CXGRID) * 8 + this.state.lxstate.xviewoffset * 8;
+    this.state.yviewpos =
+      Math.floor(chip.pos / CXGRID) * 8 + this.state.lxstate.yviewoffset * 8;
+    if (chip.moving) {
+      switch (chip.dir) {
+        case NORTH:
+          this.state.yviewpos += chip.moving;
+          break;
+        case WEST:
+          this.state.xviewpos += chip.moving;
+          break;
+        case SOUTH:
+          this.state.yviewpos -= chip.moving;
+          break;
+        case EAST:
+          this.state.xviewpos -= chip.moving;
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (!chip.hidden) {
+      if (floor === Tile.HintButton && chip.moving <= 0) {
+        this.showHint();
+      } else {
+        this.hideHint();
+      }
+      if (chip.id === Tile.Chip && this.state.lxstate.pushing) {
+        chip.id = Tile.Pushing_Chip;
+      }
+      if (chip.moving) {
+        this.resetFloorSounds(false);
+        if (floor === Tile.Fire && this.getPossession(Tile.Boots_Fire)) {
+          this.addSoundEffect(SND_FIREWALKING);
+        } else if (floor === Tile.Water && this.getPossession(Tile.Boots_Water)) {
+          this.addSoundEffect(SND_WATERWALKING);
+        } else if (isice(floor)) {
+          if (this.getPossession(Tile.Boots_Ice)) {
+            this.addSoundEffect(SND_ICEWALKING);
+          } else if (floor === Tile.Ice) {
+            this.addSoundEffect(SND_SKATING_FORWARD);
+          } else {
+            this.addSoundEffect(SND_SKATING_TURN);
+          }
+        } else if (isslide(floor)) {
+          if (this.getPossession(Tile.Boots_Slide)) {
+            this.addSoundEffect(SND_SLIDEWALKING);
+          } else {
+            this.addSoundEffect(SND_SLIDING);
+          }
+        }
+      }
+      if (this.state.lxstate.stuck && isice(floor)) {
+        this.addSoundEffect(SND_SKATING_FORWARD);
+      }
+    }
+  }
+
+  /*
+   * The functions provided by the RulesetLogic interface.
+   */
+
+  /* Initialize the gamestate structure to the state at the beginning of
+   * the level, using the data in the associated GameSetup. The level map
+   * is decoded and assembled, the list of creatures is drawn up, and other
+   * miscellaneous initializations are performed. (lxlogic.c:1772-1924)
+   */
   initGame(): boolean {
-    throw new Error("LynxLogic.initGame: not yet implemented");
+    if (pedanticMode && this.state.statusflags & SF_BADTILES) {
+      this.markInvalid();
+    }
+
+    this.state.creatures = [];
+    this.crEndIndex = 0;
+    let chipIndex = -1;
+
+    for (let pos = 0; pos < CXGRID * CYGRID; pos++) {
+      const cell = this.state.cellAt(pos);
+
+      if (cell.top.id === Tile.Block_Static) {
+        cell.top.id = crtile(Tile.Block, NORTH);
+      }
+      if (cell.bot.id === Tile.Block_Static) {
+        cell.bot.id = crtile(Tile.Block, NORTH);
+      }
+      if (ismsspecial(cell.top.id) && cell.top.id !== Tile.Exited_Chip) {
+        cell.top.id = Tile.Wall;
+        if (pedanticMode) this.markInvalid();
+      }
+      if (ismsspecial(cell.bot.id) && cell.bot.id !== Tile.Exited_Chip) {
+        cell.bot.id = Tile.Wall;
+        if (pedanticMode) this.markInvalid();
+      }
+      if (cell.bot.id !== Tile.Empty) {
+        if (!isfloor(cell.bot.id) || isfloor(cell.top.id)) {
+          console.warn(
+            `invalid "buried" tile at (${pos % CXGRID} ${Math.floor(pos / CXGRID)})`,
+          );
+          this.markInvalid();
+        }
+      }
+
+      if (iscreature(cell.top.id)) {
+        const cr: Creature = {
+          pos,
+          id: creatureid(cell.top.id),
+          dir: creaturedirid(cell.top.id),
+          moving: 0,
+          hidden: false,
+          state: 0,
+          tdir: NIL,
+          frame: 0,
+        };
+        if (pedanticMode && cr.id === Tile.Block && isice(cell.bot.id)) {
+          cr.dir = NIL;
+        }
+        if (cr.id === Tile.Chip) {
+          if (chipIndex >= 0) {
+            console.warn("multiple Chips on the map!");
+            this.markInvalid();
+          }
+          chipIndex = this.state.creatures.length;
+          cr.dir = SOUTH;
+          cr.state = 0;
+        } else {
+          cr.state = 0;
+          this.claimLocation(pos);
+        }
+        this.setFDir(cr, NIL);
+        cr.tdir = NIL;
+        cr.frame = 0;
+        this.state.creatures.push(cr);
+        this.crEndIndex++;
+
+        cell.top.id = cell.bot.id;
+        cell.bot.id = Tile.Empty;
+      }
+
+      if (pedanticMode && (cell.top.id === Tile.Wall_North || cell.top.id === Tile.Wall_West)) {
+        this.markInvalid();
+      }
+      if (cell.top.id === Tile.Beartrap) this.markBeartrap(pos);
+      if (cell.top.id === Tile.Teleport) this.markTeleport(pos);
+    }
+
+    if (chipIndex < 0) {
+      console.warn("Chip isn't on the map!");
+      this.markInvalid();
+      chipIndex = this.state.creatures.length;
+      this.state.creatures.push({
+        pos: 0,
+        id: Tile.Nothing,
+        dir: NIL,
+        moving: 0,
+        hidden: true,
+        state: 0,
+        tdir: NIL,
+        frame: 0,
+      });
+      this.crEndIndex++;
+    }
+
+    if (chipIndex !== 0) {
+      const tmp = this.state.creatures[0]!;
+      this.state.creatures[0] = this.state.creatures[chipIndex]!;
+      this.state.creatures[chipIndex] = tmp;
+    }
+
+    // Validate beartrap wirings. (lxlogic.c:1870-1882)
+    for (let i = 0; i < this.state.trapcount; i++) {
+      const xy = this.state.traps[i];
+      if (!xy) continue;
+      if (xy.from >= CXGRID * CYGRID || xy.to >= CXGRID * CYGRID) {
+        console.warn("ignoring off-map beartrap wiring");
+        xy.from = -1;
+      } else if (this.floorAt(xy.from) !== Tile.Button_Brown) {
+        console.warn(
+          `invalid beartrap wiring: no button at (${xy.from % CXGRID} ${Math.floor(xy.to / CXGRID)})`,
+        );
+      } else if (this.floorAt(xy.to) !== Tile.Beartrap) {
+        console.warn(
+          `disabling miswired beartrap button at (${xy.to % CXGRID} ${Math.floor(xy.to / CXGRID)})`,
+        );
+        xy.from = -1;
+      }
+    }
+    // Validate cloner wirings. (lxlogic.c:1883-1895)
+    for (let i = 0; i < this.state.clonercount; i++) {
+      const xy = this.state.cloners[i];
+      if (!xy) continue;
+      if (xy.from >= CXGRID * CYGRID || xy.to >= CXGRID * CYGRID) {
+        console.warn("ignoring off-map cloner wiring");
+        xy.from = -1;
+      } else if (this.floorAt(xy.from) !== Tile.Button_Red) {
+        console.warn(
+          `invalid cloner wiring: no button at (${xy.from % CXGRID} ${Math.floor(xy.to / CXGRID)})`,
+        );
+      } else if (this.floorAt(xy.to) !== Tile.CloneMachine) {
+        console.warn(
+          `disabling miswired cloner button at (${xy.to % CXGRID} ${Math.floor(xy.to / CXGRID)})`,
+        );
+        xy.from = -1;
+      }
+    }
+
+    this.state.keys[0] = this.state.keys[1] = this.state.keys[2] = this.state.keys[3] = 0;
+    this.state.boots[0] = this.state.boots[1] = this.state.boots[2] = this.state.boots[3] = 0;
+
+    this.state.lxstate.endgametimer = 0;
+    this.state.lxstate.togglestate = 0;
+    this.state.lxstate.couldntmove = 0;
+    this.state.lxstate.pushing = 0;
+    this.state.lxstate.stuck = pedanticMode ? (isice(this.floorAt(this.chipPos())) ? 1 : 0) : 0;
+    this.state.lxstate.mapbreached = 0;
+    this.state.lxstate.completed = 0;
+    this.state.lxstate.chiptopos = -1;
+    this.state.lxstate.chiptocr = null;
+    this.state.lxstate.putwall = -1;
+    this.state.lxstate.prng1 = 0;
+    this.state.lxstate.prng2 = 0;
+    this.state.initrndslidedir = this.lastRndSlideDir;
+    this.state.stepping = this.lastStepping;
+    this.state.lxstate.xviewoffset = 0;
+    this.state.lxstate.yviewoffset = 0;
+
+    this.prepareDisplay();
+    this.state.soundeffects = 0;
+    return !this.isMarkedInvalid();
   }
 
+  /* Advance the game state by one tick. (lxlogic.c:1928-2006) */
   advanceGame(): number {
-    throw new Error("LynxLogic.advanceGame: not yet implemented");
+    this.initialHousekeeping();
+
+    const chip = this.getChip();
+
+    for (let i = this.crEndIndex - 1; i >= 0; i--) {
+      const cr = this.state.creatures[i];
+      if (!cr) continue;
+      if (cr !== chip && cr.hidden) continue;
+      if (isanimation(cr.id)) {
+        --cr.frame;
+        if (cr.frame < 0) {
+          this.removeAnimation(cr);
+        }
+        continue;
+      }
+      if (cr === chip && this.state.lxstate.endgametimer) continue;
+      if (cr.moving <= 0) {
+        this.chooseMove(cr);
+      }
+    }
+
+    if (this.getFDir(chip) === NIL && chip.tdir === NIL) {
+      this.state.lxstate.couldntmove = 0;
+    } else {
+      this.checkMovingTo();
+    }
+
+    for (let i = this.crEndIndex - 1; i >= 0; i--) {
+      const cr = this.state.creatures[i];
+      if (!cr) continue;
+      if (cr === chip && this.state.lxstate.completed) continue;
+      if (cr !== chip && cr.hidden) continue;
+      if (this.advanceCreature(cr, false) < 0) continue;
+      cr.tdir = NIL;
+      this.setFDir(cr, NIL);
+      if (pedanticMode && this.floorAt(cr.pos) === Tile.PopupWall) {
+        if (cr !== chip) {
+          this.state.lxstate.putwall = this.chipPos();
+        }
+      }
+      if (this.floorAt(cr.pos) === Tile.Button_Brown && cr.moving <= 0) {
+        this.springTrap(this.trapFromButton(cr.pos));
+      }
+    }
+
+    for (let i = this.crEndIndex - 1; i >= 0; i--) {
+      const cr = this.state.creatures[i];
+      if (!cr) continue;
+      if (cr.hidden) continue;
+      if (cr.moving) continue;
+      if (this.floorAt(cr.pos) === Tile.Teleport) {
+        this.teleportCreature(cr);
+      }
+    }
+
+    if (this.state.lxstate.putwall !== -1) {
+      if (!this.getChip().hidden) {
+        if (this.floorAt(this.chipPos()) === Tile.Beartrap) {
+          this.springTrap(this.chipPos());
+        }
+        this.state.cellAt(this.state.lxstate.putwall).top.id = Tile.Wall;
+      }
+      this.state.lxstate.putwall = -1;
+    }
+
+    this.finalHousekeeping();
+    this.prepareDisplay();
+
+    if (this.state.lxstate.endgametimer) {
+      --this.state.timeoffset;
+      --this.state.lxstate.endgametimer;
+      if (this.state.lxstate.endgametimer === 0) {
+        this.resetFloorSounds(true);
+        return this.state.lxstate.completed ? 1 : -1;
+      }
+    }
+
+    return 0;
   }
 
+  /* Free resources associated with the current game state. Does nothing
+   * in this port (no per-game resources are separately allocated).
+   * (lxlogic.c:2010-2014)
+   */
   endGame(): boolean {
-    throw new Error("LynxLogic.endGame: not yet implemented");
+    return true;
   }
 }
