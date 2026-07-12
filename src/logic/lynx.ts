@@ -42,9 +42,15 @@
 //   last logically-active creature (i.e. creatures at index >= crEndIndex
 //   are "hidden"/free slots available for reuse by newcreature()).
 //   Reverse iteration should walk `for (let i = crEndIndex - 1; i >= 0; i--)`.
-//   This field is declared now but not yet maintained — that is the job of
-//   the creature-list layer (newcreature/removecreature) in a later
-//   sub-step.
+//
+// - `crEndIndex` is now maintained (as of the creature-list layer,
+//   newCreature/removeCreature/removeAnimation). `this.state.creatures` is a
+//   plain growable array, not a fixed preallocated buffer with a Nothing-id
+//   sentinel like the C original, so "growing the list" in `newCreature()`
+//   just pushes/writes a fresh Creature object at index `crEndIndex` when no
+//   hidden slot exists to reuse and increments `crEndIndex`. The two C
+//   capacity checks (`MAX_CREATURES`, and pedantic-mode's `PMAX_CREATURES`)
+//   are still enforced against `crEndIndex` before growing.
 
 import {
   CXGRID,
@@ -53,9 +59,12 @@ import {
   WEST,
   SOUTH,
   EAST,
+  NIL,
   Ruleset,
   Tile,
   right,
+  isanimation,
+  isice,
   SND_SKATING_FORWARD,
   SND_SKATING_TURN,
   SND_FIREWALKING,
@@ -64,6 +73,9 @@ import {
   SND_SLIDEWALKING,
   SND_SLIDING,
   SND_BLOCK_MOVING,
+  SND_WATER_SPLASH,
+  SND_BOMB_EXPLODES,
+  SND_CHIP_LOSES,
 } from "../constants";
 import { GameState } from "../state";
 import type { Creature } from "../types";
@@ -114,6 +126,13 @@ const FS_CLAIMED = 0x40;
 const FS_ANIMATED = 0x20;
 const FS_BEARTRAP = 0x01;
 const FS_TELEPORT = 0x02;
+
+/* Creature state flags. (lxlogic.c:342-348) */
+const CS_FDIRMASK = 0x0f;
+const CS_SLIDETOKEN = 0x10;
+const CS_REVERSE = 0x20;
+const CS_PUSHED = 0x40;
+const CS_TELEPORTED = 0x80;
 
 export class LynxLogic implements RulesetLogic {
   readonly ruleset = Ruleset.Lynx;
@@ -425,6 +444,185 @@ export class LynxLogic implements RulesetLogic {
     if (includePushing) {
       this.stopSoundEffect(SND_BLOCK_MOVING);
     }
+  }
+
+  /*
+   * Functions that manage the list of entities. (lxlogic.c:337-496)
+   */
+
+  /* getfdir(cr)/setfdir(cr, d) — temp storage for forced moves, packed
+   * into the low nibble of cr.state. (lxlogic.c:350-352)
+   */
+  private getFDir(cr: Creature): number {
+    return cr.state & CS_FDIRMASK;
+  }
+
+  private setFDir(cr: Creature, d: number): void {
+    cr.state = (cr.state & ~CS_FDIRMASK) | (d & CS_FDIRMASK);
+  }
+
+  /* Return the creature located at pos. Ignores Chip unless includeChip
+   * is true. (lxlogic.c:354-369)
+   */
+  private lookupCreature(pos: number, includeChip: boolean): Creature | null {
+    const start = includeChip ? 0 : 1;
+    for (let i = start; i < this.crEndIndex; i++) {
+      const cr = this.state.creatures[i];
+      if (cr && cr.pos === pos && !cr.hidden && !isanimation(cr.id)) {
+        return cr;
+      }
+    }
+    return null;
+  }
+
+  /* Return a fresh creature. (lxlogic.c:373-392)
+   *
+   * Design note: unlike the C version's fixed-size preallocated array with
+   * a Nothing-id sentinel, `this.state.creatures` is a plain growable
+   * array. `crEndIndex` is the authoritative logical count; slots at or
+   * beyond it are ignored. When no hidden slot is available for reuse and
+   * the array itself hasn't grown that far yet, a new Creature is pushed
+   * onto the array before being claimed.
+   */
+  private newCreature(): Creature | null {
+    for (let i = 1; i < this.crEndIndex; i++) {
+      const cr = this.state.creatures[i];
+      if (cr && cr.hidden) {
+        return cr;
+      }
+    }
+    if (this.crEndIndex >= MAX_CREATURES) {
+      console.warn("Ran out of room in the creatures array!");
+      return null;
+    }
+    if (pedanticMode && this.crEndIndex >= PMAX_CREATURES) {
+      return null;
+    }
+
+    let cr = this.state.creatures[this.crEndIndex];
+    if (!cr) {
+      cr = {
+        pos: 0,
+        id: Tile.Nothing,
+        dir: 0,
+        moving: 0,
+        frame: 0,
+        hidden: false,
+        state: 0,
+        tdir: 0,
+      };
+      this.state.creatures[this.crEndIndex] = cr;
+    }
+    cr.hidden = true;
+    this.crEndIndex++;
+    return cr;
+  }
+
+  /* Flag all tanks to turn around. (lxlogic.c:396-409) */
+  private turnTanks(): void {
+    for (let i = 0; i < this.crEndIndex; i++) {
+      const cr = this.state.creatures[i];
+      if (!cr) continue;
+      if (cr.hidden) continue;
+      if (cr.id !== Tile.Tank) continue;
+      const floor = this.floorAt(cr.pos);
+      if (floor === Tile.CloneMachine || isice(floor)) continue;
+      cr.state ^= CS_REVERSE;
+    }
+  }
+
+  /* Start an animation sequence at the spot (formerly) occupied by the
+   * given creature. The creature's slot in the creature list is reused
+   * by the animation sequence. (lxlogic.c:415-432)
+   */
+  private removeCreature(cr: Creature, animationId: number): void {
+    if (cr.id !== Tile.Chip) {
+      this.removeClaim(cr.pos);
+    }
+    if (cr.state & CS_PUSHED) {
+      this.stopSoundEffect(SND_BLOCK_MOVING);
+    }
+    cr.id = animationId;
+    cr.frame = (this.state.currenttime + this.state.stepping) & 1 ? 12 : 11;
+    --cr.frame;
+    cr.hidden = false;
+    cr.state = 0;
+    cr.tdir = NIL;
+    if (cr.moving === 8) {
+      cr.pos -= delta[cr.dir] ?? 0;
+      cr.moving = 0;
+    }
+    this.markAnimated(cr.pos);
+  }
+
+  /* End the given animation sequence (thus removing the final vestige of
+   * an ex-creature). (lxlogic.c:437-445)
+   */
+  private removeAnimation(cr: Creature): void {
+    cr.hidden = true;
+    this.clearAnimated(cr.pos);
+    if (cr === this.state.creatures[this.crEndIndex - 1]) {
+      cr.id = Tile.Nothing;
+      --this.crEndIndex;
+    }
+  }
+
+  /* Abort the animation sequence occuring at the given location.
+   * (lxlogic.c:449-460)
+   */
+  private stopAnimationAt(pos: number): boolean {
+    for (let i = 0; i < this.crEndIndex; i++) {
+      const anim = this.state.creatures[i];
+      if (anim && !anim.hidden && anim.pos === pos && isanimation(anim.id)) {
+        this.removeAnimation(anim);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* What happens when Chip dies. reason indicates the cause of death.
+   * also is either null or points to a creature that dies with Chip.
+   * (lxlogic.c:465-496)
+   */
+  private removeChip(reason: ChipStatus, also: Creature | null): void {
+    const chip = this.getChip();
+
+    switch (reason) {
+      case ChipStatus.CHIP_DROWNED:
+        this.addSoundEffect(SND_WATER_SPLASH);
+        this.removeCreature(chip, Tile.Water_Splash);
+        break;
+      case ChipStatus.CHIP_BOMBED:
+        this.addSoundEffect(SND_BOMB_EXPLODES);
+        this.removeCreature(chip, Tile.Bomb_Explosion);
+        break;
+      case ChipStatus.CHIP_OUTOFTIME:
+        this.removeCreature(chip, Tile.Entity_Explosion);
+        break;
+      case ChipStatus.CHIP_BURNED:
+        this.addSoundEffect(SND_CHIP_LOSES);
+        this.removeCreature(chip, Tile.Entity_Explosion);
+        break;
+      case ChipStatus.CHIP_COLLIDED:
+        this.addSoundEffect(SND_CHIP_LOSES);
+        this.removeCreature(chip, Tile.Entity_Explosion);
+        if (also && also !== chip) {
+          this.removeCreature(also, Tile.Entity_Explosion);
+        }
+        break;
+      default:
+        break;
+    }
+
+    this.resetFloorSounds(false);
+    this.startEndGameTimer();
+    this.state.timeoffset = 1;
+  }
+
+  /* startendgametimer() macro. (lxlogic.c, see logic.h) */
+  private startEndGameTimer(): void {
+    this.state.lxstate.endgametimer = 12 + 1;
   }
 
   /*
