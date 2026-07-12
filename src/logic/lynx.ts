@@ -62,9 +62,14 @@ import {
   NIL,
   Ruleset,
   Tile,
+  left,
   right,
+  back,
   isanimation,
   isice,
+  isslide,
+  isdoor,
+  directionalcmd,
   SND_SKATING_FORWARD,
   SND_SKATING_TURN,
   SND_FIREWALKING,
@@ -133,6 +138,161 @@ const CS_SLIDETOKEN = 0x10;
 const CS_REVERSE = 0x20;
 const CS_PUSHED = 0x40;
 const CS_TELEPORTED = 0x80;
+
+/*
+ * The laws of movement across the various floors. (lxlogic.c:498-671)
+ *
+ * Chip, blocks, and other creatures all have slightly different rules
+ * about what sort of tiles they are permitted to move into and out of.
+ * The following lookup table encapsulates these rules. Note that these
+ * rules are only the first check; a creature may be generally permitted
+ * a particular type of move but still prevented in a specific situation.
+ */
+
+const DIR_IN = (dir: number): number => dir;
+const DIR_OUT = (dir: number): number => dir << 4;
+
+const NORTH_IN = DIR_IN(NORTH);
+const WEST_IN = DIR_IN(WEST);
+const SOUTH_IN = DIR_IN(SOUTH);
+const EAST_IN = DIR_IN(EAST);
+const NORTH_OUT = DIR_OUT(NORTH);
+const WEST_OUT = DIR_OUT(WEST);
+const SOUTH_OUT = DIR_OUT(SOUTH);
+const EAST_OUT = DIR_OUT(EAST);
+const ALL_IN = NORTH_IN | WEST_IN | SOUTH_IN | EAST_IN;
+const ALL_OUT = NORTH_OUT | WEST_OUT | SOUTH_OUT | EAST_OUT;
+const ALL_IN_OUT = ALL_IN | ALL_OUT;
+
+interface MoveLaw {
+  chip: number;
+  block: number;
+  creature: number;
+}
+
+/* Indexed by floor tile ID (0x00-0x3F). Transcribed directly from
+ * lxlogic.c:524-671, entry by entry, in the same order; comments name
+ * the tile at that index (matching the `Tile` enum in ../constants), but
+ * it is the array *position* that lxlogic.c relies on, not the comment.
+ */
+const movelaws: readonly MoveLaw[] = [
+  { chip: 0, block: 0, creature: 0 }, // Nothing
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Empty
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Slide_North
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Slide_West
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Slide_South
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Slide_East
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Slide_Random
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Ice
+  {
+    // IceWall_Northwest
+    chip: NORTH_OUT | WEST_OUT | SOUTH_IN | EAST_IN,
+    block: NORTH_OUT | WEST_OUT | SOUTH_IN | EAST_IN,
+    creature: NORTH_OUT | WEST_OUT | SOUTH_IN | EAST_IN,
+  },
+  {
+    // IceWall_Northeast
+    chip: NORTH_OUT | EAST_OUT | SOUTH_IN | WEST_IN,
+    block: NORTH_OUT | EAST_OUT | SOUTH_IN | WEST_IN,
+    creature: NORTH_OUT | EAST_OUT | SOUTH_IN | WEST_IN,
+  },
+  {
+    // IceWall_Southwest
+    chip: SOUTH_OUT | WEST_OUT | NORTH_IN | EAST_IN,
+    block: SOUTH_OUT | WEST_OUT | NORTH_IN | EAST_IN,
+    creature: SOUTH_OUT | WEST_OUT | NORTH_IN | EAST_IN,
+  },
+  {
+    // IceWall_Southeast
+    chip: SOUTH_OUT | EAST_OUT | NORTH_IN | WEST_IN,
+    block: SOUTH_OUT | EAST_OUT | NORTH_IN | WEST_IN,
+    creature: SOUTH_OUT | EAST_OUT | NORTH_IN | WEST_IN,
+  },
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_OUT }, // Gravel
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Dirt
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Water
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Fire
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Bomb
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Beartrap
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Burglar
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // HintButton
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Button_Blue
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Button_Green
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Button_Red
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Button_Brown
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Teleport
+  { chip: ALL_OUT, block: ALL_OUT, creature: ALL_OUT }, // Wall
+  {
+    // Wall_North
+    chip: NORTH_IN | WEST_IN | EAST_IN | WEST_OUT | SOUTH_OUT | EAST_OUT,
+    block: NORTH_IN | WEST_IN | EAST_IN | WEST_OUT | SOUTH_OUT | EAST_OUT,
+    creature: NORTH_IN | WEST_IN | EAST_IN | WEST_OUT | SOUTH_OUT | EAST_OUT,
+  },
+  {
+    // Wall_West
+    chip: NORTH_IN | WEST_IN | SOUTH_IN | NORTH_OUT | SOUTH_OUT | EAST_OUT,
+    block: NORTH_IN | WEST_IN | SOUTH_IN | NORTH_OUT | SOUTH_OUT | EAST_OUT,
+    creature: NORTH_IN | WEST_IN | SOUTH_IN | NORTH_OUT | SOUTH_OUT | EAST_OUT,
+  },
+  {
+    // Wall_South
+    chip: WEST_IN | SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT | EAST_OUT,
+    block: WEST_IN | SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT | EAST_OUT,
+    creature: WEST_IN | SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT | EAST_OUT,
+  },
+  {
+    // Wall_East
+    chip: NORTH_IN | SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT | SOUTH_OUT,
+    block: NORTH_IN | SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT | SOUTH_OUT,
+    creature: NORTH_IN | SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT | SOUTH_OUT,
+  },
+  {
+    // Wall_Southeast
+    chip: SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT,
+    block: SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT,
+    creature: SOUTH_IN | EAST_IN | NORTH_OUT | WEST_OUT,
+  },
+  { chip: ALL_OUT, block: ALL_OUT, creature: ALL_OUT }, // HiddenWall_Perm
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // HiddenWall_Temp
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // BlueWall_Real
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // BlueWall_Fake
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // SwitchWall_Open
+  { chip: ALL_OUT, block: ALL_OUT, creature: ALL_OUT }, // SwitchWall_Closed
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // PopupWall
+  { chip: ALL_OUT, block: ALL_OUT, creature: ALL_OUT }, // CloneMachine
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Door_Red
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Door_Blue
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Door_Yellow
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Door_Green
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Socket
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Exit
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // ICChip
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Key_Red
+  { chip: ALL_IN_OUT, block: ALL_IN_OUT, creature: ALL_IN_OUT }, // Key_Blue
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Key_Yellow
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Key_Green
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Boots_Slide
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Boots_Ice
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Boots_Water
+  { chip: ALL_IN_OUT, block: ALL_OUT, creature: ALL_OUT }, // Boots_Fire
+  { chip: 0, block: 0, creature: 0 }, // Block_Static
+  { chip: 0, block: 0, creature: 0 }, // Drowned_Chip
+  { chip: 0, block: 0, creature: 0 }, // Burned_Chip
+  { chip: 0, block: 0, creature: 0 }, // Bombed_Chip
+  { chip: 0, block: 0, creature: 0 }, // Exited_Chip
+  { chip: 0, block: 0, creature: 0 }, // Exit_Extra_1
+  { chip: 0, block: 0, creature: 0 }, // Exit_Extra_2
+  { chip: 0, block: 0, creature: 0 }, // Overlay_Buffer
+  { chip: 0, block: 0, creature: 0 }, // Floor_Reserved2
+  { chip: 0, block: 0, creature: 0 }, // Floor_Reserved1
+];
+
+/* canmakemove() flag bits. (lxlogic.c:684-688) */
+const CMM_RELEASING = 0x0001;
+const CMM_CLEARANIMATIONS = 0x0002;
+const CMM_STARTMOVEMENT = 0x0004;
+const CMM_PUSHBLOCKS = 0x0008;
+const CMM_PUSHBLOCKSNOW = 0x0010;
 
 export class LynxLogic implements RulesetLogic {
   readonly ruleset = Ruleset.Lynx;
@@ -623,6 +783,367 @@ export class LynxLogic implements RulesetLogic {
   /* startendgametimer() macro. (lxlogic.c, see logic.h) */
   private startEndGameTimer(): void {
     this.state.lxstate.endgametimer = 12 + 1;
+  }
+
+  /*
+   * The movement-decision layer. (lxlogic.c:498-1061)
+   */
+
+  /* Return TRUE if the given block is allowed to be moved in the given
+   * direction. If flags includes CMM_PUSHBLOCKSNOW, then the indicated
+   * movement of the block will be initiated. (lxlogic.c:694-718)
+   */
+  private canPushBlock(block: Creature, dir: number, flags: number): boolean {
+    if (!this.canMakeMove(block, dir, flags)) {
+      if (!block.moving && (flags & (CMM_PUSHBLOCKS | CMM_PUSHBLOCKSNOW))) {
+        block.dir = dir;
+        if (pedanticMode) {
+          block.tdir = dir;
+        }
+      }
+      return false;
+    }
+    if (flags & (CMM_PUSHBLOCKS | CMM_PUSHBLOCKSNOW)) {
+      block.dir = dir;
+      block.tdir = dir;
+      block.state |= CS_PUSHED;
+      if (flags & CMM_PUSHBLOCKSNOW) {
+        this.advanceCreature(block, false);
+      }
+    }
+
+    return true;
+  }
+
+  /* Return TRUE if the given creature is allowed to attempt to move in
+   * the given direction. Side effects can and will occur from calling
+   * this function, as indicated by flags. (lxlogic.c:724-818)
+   */
+  private canMakeMove(cr: Creature, dir: number, flags: number): boolean {
+    let floor = this.floorAt(cr.pos);
+    switch (floor) {
+      case Tile.Wall_North:
+        if (dir & NORTH) return false;
+        break;
+      case Tile.Wall_West:
+        if (dir & WEST) return false;
+        break;
+      case Tile.Wall_South:
+        if (dir & SOUTH) return false;
+        break;
+      case Tile.Wall_East:
+        if (dir & EAST) return false;
+        break;
+      case Tile.Wall_Southeast:
+        if (dir & (SOUTH | EAST)) return false;
+        break;
+      case Tile.IceWall_Northwest:
+        if (dir & (SOUTH | EAST)) return false;
+        break;
+      case Tile.IceWall_Northeast:
+        if (dir & (SOUTH | WEST)) return false;
+        break;
+      case Tile.IceWall_Southwest:
+        if (dir & (NORTH | EAST)) return false;
+        break;
+      case Tile.IceWall_Southeast:
+        if (dir & (NORTH | WEST)) return false;
+        break;
+      case Tile.Beartrap:
+      case Tile.CloneMachine:
+        if (!(flags & CMM_RELEASING)) return false;
+        break;
+      default:
+        break;
+    }
+
+    if (
+      isslide(floor) &&
+      (cr.id !== Tile.Chip || this.getPossession(Tile.Boots_Slide) === 0) &&
+      this.getSlideDir(floor, false) === back(dir)
+    ) {
+      return false;
+    }
+
+    let y = Math.floor(cr.pos / CXGRID);
+    let x = cr.pos % CXGRID;
+    y += dir === NORTH ? -1 : dir === SOUTH ? 1 : 0;
+    x += dir === WEST ? -1 : dir === EAST ? 1 : 0;
+    const to = y * CXGRID + x;
+
+    if (x < 0 || x >= CXGRID) return false;
+    if (y < 0 || y >= CYGRID) {
+      if (pedanticMode) {
+        if (flags & CMM_STARTMOVEMENT) {
+          this.state.lxstate.mapbreached = 1;
+          console.warn(`map breach in pedantic mode at (${x} ${y})`);
+        }
+      }
+      return false;
+    }
+
+    floor = this.floorAt(to);
+    if (floor === Tile.SwitchWall_Open || floor === Tile.SwitchWall_Closed) {
+      floor ^= this.state.lxstate.togglestate;
+    }
+
+    if (cr.id === Tile.Chip) {
+      const law = movelaws[floor];
+      if (!law || !(law.chip & dir)) return false;
+      if (floor === Tile.Socket && this.state.chipsneeded > 0) return false;
+      if (isdoor(floor) && this.getPossession(floor) === 0) return false;
+      if (this.isMarkedAnimated(to)) return false;
+      const other = this.lookupCreature(to, false);
+      if (other && other.id === Tile.Block) {
+        if (!this.canPushBlock(other, dir, flags & ~CMM_RELEASING)) return false;
+      }
+      if (floor === Tile.HiddenWall_Temp || floor === Tile.BlueWall_Real) {
+        if (flags & CMM_STARTMOVEMENT) {
+          this.state.cellAt(to).top.id = Tile.Wall;
+        }
+        return false;
+      }
+    } else if (cr.id === Tile.Block) {
+      if (cr.moving > 0) return false;
+      const law = movelaws[floor];
+      if (!law || !(law.block & dir)) return false;
+      if (this.isLocationClaimed(to)) return false;
+      if (flags & CMM_CLEARANIMATIONS) {
+        if (this.isMarkedAnimated(to)) this.stopAnimationAt(to);
+      }
+    } else {
+      const law = movelaws[floor];
+      if (!law || !(law.creature & dir)) return false;
+      if (this.isLocationClaimed(to)) return false;
+      if (floor === Tile.Fire && cr.id !== Tile.Fireball) return false;
+      if (flags & CMM_CLEARANIMATIONS) {
+        if (this.isMarkedAnimated(to)) this.stopAnimationAt(to);
+      }
+    }
+
+    return true;
+  }
+
+  /* This function embodies the movement behavior of all the creatures.
+   * Given a creature, this function enumerates its desired direction of
+   * movement and selects the first one that is permitted.
+   * (lxlogic.c:828-932)
+   */
+  private chooseCreatureMove(cr: Creature): void {
+    const choices: number[] = [NIL, NIL, NIL, NIL];
+    let pdir = NIL;
+
+    if (isanimation(cr.id)) return;
+
+    cr.tdir = NIL;
+    if (cr.id === Tile.Block) return;
+    if (this.getFDir(cr) !== NIL) return;
+    const floor = this.floorAt(cr.pos);
+    if (floor === Tile.CloneMachine || floor === Tile.Beartrap) {
+      cr.tdir = cr.dir;
+      return;
+    }
+
+    const dir = cr.dir;
+
+    switch (cr.id) {
+      case Tile.Tank:
+        choices[0] = dir;
+        break;
+      case Tile.Ball:
+        choices[0] = dir;
+        choices[1] = back(dir);
+        break;
+      case Tile.Glider:
+        choices[0] = dir;
+        choices[1] = left(dir);
+        choices[2] = right(dir);
+        choices[3] = back(dir);
+        break;
+      case Tile.Fireball:
+        choices[0] = dir;
+        choices[1] = right(dir);
+        choices[2] = left(dir);
+        choices[3] = back(dir);
+        break;
+      case Tile.Bug:
+        choices[0] = left(dir);
+        choices[1] = dir;
+        choices[2] = right(dir);
+        choices[3] = back(dir);
+        break;
+      case Tile.Paramecium:
+        choices[0] = right(dir);
+        choices[1] = dir;
+        choices[2] = left(dir);
+        choices[3] = back(dir);
+        break;
+      case Tile.Walker:
+        choices[0] = dir;
+        choices[1] = WALKER_TURN;
+        break;
+      case Tile.Blob:
+        choices[0] = BLOB_TURN;
+        break;
+      case Tile.Teeth: {
+        if ((this.state.currenttime + this.state.stepping) & 4) return;
+        let y = Math.floor(this.chipPos() / CXGRID) - Math.floor(cr.pos / CXGRID);
+        let x = (this.chipPos() % CXGRID) - (cr.pos % CXGRID);
+        const n0 = y < 0 ? NORTH : y > 0 ? SOUTH : NIL;
+        if (y < 0) y = -y;
+        const m0 = x < 0 ? WEST : x > 0 ? EAST : NIL;
+        if (x < 0) x = -x;
+        if (x > y) {
+          choices[0] = m0;
+          choices[1] = n0;
+        } else {
+          choices[0] = n0;
+          choices[1] = m0;
+        }
+        pdir = choices[0]!;
+        break;
+      }
+      default:
+        break;
+    }
+
+    for (let n = 0; n < 4 && choices[n] !== NIL; ++n) {
+      if (choices[n] === WALKER_TURN) {
+        let m = this.lynxPrng() & 3;
+        choices[n] = cr.dir;
+        while (m--) {
+          choices[n] = right(choices[n]!);
+        }
+      } else if (choices[n] === BLOB_TURN) {
+        const cw = [NORTH, EAST, SOUTH, WEST];
+        choices[n] = cw[this.state.mainprng.random4()]!;
+      }
+      cr.tdir = choices[n]!;
+      if (this.canMakeMove(cr, choices[n]!, CMM_CLEARANIMATIONS)) return;
+    }
+
+    if (pdir !== NIL) cr.tdir = pdir;
+  }
+
+  /* Determine the direction of Chip's next move. If discard is true,
+   * then Chip is not currently permitted to select a direction of
+   * movement, and the player's input should not be retained.
+   * (lxlogic.c:938-981)
+   */
+  private chooseChipMove(cr: Creature, discard: boolean): void {
+    this.state.lxstate.pushing = 0;
+
+    let dir = this.state.currentinput;
+    this.state.currentinput = NIL;
+
+    if (!directionalcmd(dir)) dir = NIL;
+
+    if (dir === NIL || discard || this.state.lxstate.stuck) {
+      cr.tdir = NIL;
+      return;
+    }
+
+    this.state.lastmove = dir;
+    cr.tdir = dir;
+
+    if (cr.tdir !== NIL) dir = cr.tdir;
+    else if (this.getFDir(cr) !== NIL) dir = this.getFDir(cr);
+    else return;
+
+    if (isDiagonal(dir)) {
+      if (cr.dir & dir) {
+        const f1 = this.canMakeMove(cr, cr.dir, CMM_PUSHBLOCKS);
+        const f2 = this.canMakeMove(cr, cr.dir ^ dir, CMM_PUSHBLOCKS);
+        dir = !f1 && f2 ? dir ^ cr.dir : cr.dir;
+      } else {
+        if (this.canMakeMove(cr, dir & (EAST | WEST), CMM_PUSHBLOCKS)) {
+          dir &= EAST | WEST;
+        } else {
+          dir &= NORTH | SOUTH;
+        }
+      }
+      cr.tdir = dir;
+    } else {
+      this.canMakeMove(cr, dir, CMM_PUSHBLOCKS);
+    }
+  }
+
+  /* This function determines if the given creature is currently being
+   * forced to move. (Ice, slide floors, and teleports are the three
+   * possible causes of this. Bear traps and clone machines also cause
+   * forced movement, but these are handled outside of the normal
+   * movement sequence.) If so, the direction is stored in the
+   * creature's fdir field, and true is returned unless the creature can
+   * override the forced move. (lxlogic.c:991-1023)
+   */
+  private getForcedMove(cr: Creature): boolean {
+    this.setFDir(cr, NIL);
+
+    const floor = this.floorAt(cr.pos);
+
+    if (this.state.currenttime === 0) return false;
+
+    if (isice(floor)) {
+      if (cr.id === Tile.Chip && this.getPossession(Tile.Boots_Ice) !== 0) return false;
+      if (cr.id === Tile.Chip && this.state.lxstate.stuck) return false;
+      if (cr.dir === NIL) return false;
+      this.setFDir(cr, cr.dir);
+      return true;
+    } else if (isslide(floor)) {
+      if (cr.id === Tile.Chip && this.getPossession(Tile.Boots_Slide) !== 0) return false;
+      this.setFDir(cr, this.getSlideDir(floor, true));
+      return !(cr.state & CS_SLIDETOKEN);
+    } else if (cr.state & CS_TELEPORTED) {
+      cr.state &= ~CS_TELEPORTED;
+      this.setFDir(cr, cr.dir);
+      return true;
+    }
+
+    return false;
+  }
+
+  /* Return the move a creature will make on the current tick.
+   * (lxlogic.c:1027-1041)
+   */
+  private chooseMove(cr: Creature): boolean {
+    if (cr.id === Tile.Chip) {
+      this.chooseChipMove(cr, this.getForcedMove(cr));
+      if (cr.tdir === NIL && this.getFDir(cr) === NIL) {
+        this.resetFloorSounds(false);
+      }
+    } else {
+      if (this.getForcedMove(cr)) {
+        cr.tdir = NIL;
+      } else if (cr.id !== Tile.Block) {
+        this.chooseCreatureMove(cr);
+      }
+    }
+
+    return cr.tdir !== NIL || this.getFDir(cr) !== NIL;
+  }
+
+  /* Update the location that Chip is currently moving into (and reset
+   * the pointer to the creature that Chip is colliding with).
+   * (lxlogic.c:1046-1061)
+   */
+  private checkMovingTo(): void {
+    const cr = this.getChip();
+    const dir = cr.tdir;
+    if (dir === NIL || isDiagonal(dir)) {
+      this.state.lxstate.chiptopos = -1;
+      this.state.lxstate.chiptocr = null;
+      return;
+    }
+
+    this.state.lxstate.chiptopos = cr.pos + (delta[dir] ?? 0);
+    this.state.lxstate.chiptocr = null;
+  }
+
+  /* advancecreature() — not yet implemented; a later sub-step owns the
+   * real body (movement execution). Referenced by canPushBlock() above.
+   */
+  private advanceCreature(cr: Creature, releasing: boolean): number {
+    throw new Error("LynxLogic.advanceCreature: not yet implemented");
   }
 
   /*
