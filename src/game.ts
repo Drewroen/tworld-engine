@@ -6,6 +6,7 @@
 import { NIL, Ruleset, SND_ONESHOT_COUNT, TICKS_PER_SECOND } from "./constants";
 import { expandLevelData } from "./decoder";
 import { LynxLogic } from "./logic/lynx";
+import { MsLogic } from "./logic/ms";
 import type { RulesetLogic } from "./logic/ruleset";
 import { GameState } from "./state";
 import type { Action, Creature, GameSetup } from "./types";
@@ -71,7 +72,7 @@ export class Game {
     if (ruleset === Ruleset.Lynx) {
       this.logic = new LynxLogic(state);
     } else if (ruleset === Ruleset.MS) {
-      throw new Error("Game: MS ruleset not yet implemented (Task 11).");
+      this.logic = new MsLogic(state);
     } else {
       throw new Error(`Game: unknown ruleset ${ruleset}.`);
     }

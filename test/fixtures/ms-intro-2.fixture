@@ -1,0 +1,30 @@
+# Fixture definition for the C oracle harness (tools/oracle/harness).
+# See tools/oracle/gen-fixtures.sh for the format this file is parsed with:
+# plain "key=value" lines, one per line, "#" starts a comment.
+#
+# dat        - .dat filename, resolved relative to tworld/data/
+# level      - level index within the .dat file (0-based)
+# ruleset    - "ms" or "lynx"
+# rndseed    - seed passed to restartprng()
+# rndslidedir- initial random-slide direction (0/1/2/4/8)
+# stepping   - initial timer stepping offset (0-7)
+# maxTicks   - number of ticks to simulate
+# moves      - space-separated "when:dir" pairs (dir: 0=NIL 1=N 2=W 4=S 8=E)
+#
+# intro.dat level 2, "FRIENDS AND ENEMIES" under the MS ruleset -- exercises
+# multiple monsters (bugs/gliders/etc) moving autonomously with no Chip
+# input at all. MS's monster-stepping logic (mslogic.c) uses a different
+# direction-preference/tie-break algorithm than Lynx's, so this is a good
+# check that MS's internal creature list doesn't desync chipsneeded/
+# statusflags/soundeffects even though it isn't exposed via the digest
+# (see mslogic.c's module-static creature list, which has no accessor --
+# hence "creatures":[] here, same as ms-intro-1).
+
+dat=intro.dat
+level=2
+ruleset=ms
+rndseed=1
+rndslidedir=0
+stepping=0
+maxTicks=8
+moves=

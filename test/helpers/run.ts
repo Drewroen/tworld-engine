@@ -67,11 +67,10 @@ export function runScript(fixturePath: URL | string): TickDigest[] {
   const fsPath = typeof fixturePath === "string" ? fixturePath : fileURLToPath(fixturePath);
   const fixture = parseFixture(readFileSync(fsPath, "utf8"));
 
-  if (fixture.ruleset !== "lynx") {
-    throw new Error(
-      `runScript: unsupported ruleset "${fixture.ruleset}" (only "lynx" is implemented so far)`,
-    );
+  if (fixture.ruleset !== "lynx" && fixture.ruleset !== "ms") {
+    throw new Error(`runScript: unsupported ruleset "${fixture.ruleset}"`);
   }
+  const ruleset = fixture.ruleset === "ms" ? Ruleset.MS : Ruleset.Lynx;
 
   // dat is resolved relative to tworld/data/, i.e. from
   // tworld-engine/test/fixtures/*.fixture the path is
@@ -84,7 +83,7 @@ export function runScript(fixturePath: URL | string): TickDigest[] {
     throw new Error(`runScript: level ${fixture.level} not found in ${fixture.dat}`);
   }
 
-  const game = new Game(level, Ruleset.Lynx, fixture.rndseed);
+  const game = new Game(level, ruleset, fixture.rndseed);
   // Note: these two assignments are inert in practice (matching the real C
   // harness's own behavior) — LynxLogic.initGame(), already invoked inside
   // the Game constructor, unconditionally overwrites
