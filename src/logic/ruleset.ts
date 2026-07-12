@@ -9,6 +9,8 @@
 // an instance field bound once at construction time; there is no need
 // for a shutdown() method since there is no manual memory to release.
 
+import type { Creature } from "../types";
+
 export interface RulesetLogic {
   readonly ruleset: number;
   /** Prepare to play a game. Returns true on success (mirrors C's int-as-bool). */
@@ -17,4 +19,12 @@ export interface RulesetLogic {
   advanceGame(): number;
   /** Clean up after the game is done. Returns true on success. */
   endGame(): boolean;
+  /**
+   * The live, active creature list (Chip included), if this ruleset exposes
+   * one. Lynx keeps its list directly on GameState (see lxlogic.c's
+   * creaturelist() macro) so this is cheap; MS keeps its list in a private
+   * module-static array with no accessor (see tools/oracle/harness.c's
+   * digest notes), so an MS implementation may omit this method.
+   */
+  activeCreatures?(): Creature[];
 }

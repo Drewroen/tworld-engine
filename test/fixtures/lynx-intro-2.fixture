@@ -1,0 +1,25 @@
+# Fixture definition for the C oracle harness (tools/oracle/harness).
+# See tools/oracle/gen-fixtures.sh for the format this file is parsed with:
+# plain "key=value" lines, one per line, "#" starts a comment.
+#
+# dat        - .dat filename, resolved relative to tworld/data/
+# level      - level index within the .dat file (0-based)
+# ruleset    - "ms" or "lynx"
+# rndseed    - seed passed to restartprng()
+# rndslidedir- initial random-slide direction (0/1/2/4/8)
+# stepping   - initial timer stepping offset (0-7)
+# maxTicks   - number of ticks to simulate
+# moves      - space-separated "when:dir" pairs (dir: 0=NIL 1=N 2=W 4=S 8=E)
+#
+# intro.dat level 2, "FRIENDS AND ENEMIES" -- exercises multiple monsters
+# (bugs/gliders/etc) moving autonomously with no Chip input at all, so the
+# per-tick creature-list digest is the whole fidelity signal here.
+
+dat=intro.dat
+level=2
+ruleset=lynx
+rndseed=1
+rndslidedir=0
+stepping=0
+maxTicks=8
+moves=

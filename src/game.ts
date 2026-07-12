@@ -8,7 +8,7 @@ import { expandLevelData } from "./decoder";
 import { LynxLogic } from "./logic/lynx";
 import type { RulesetLogic } from "./logic/ruleset";
 import { GameState } from "./state";
-import type { Action, GameSetup } from "./types";
+import type { Action, Creature, GameSetup } from "./types";
 
 // play.c does not define a numeric CmdPreserve constant anywhere the TS port
 // has ported so far (it's just an ordinary auto-incremented enum member in
@@ -135,5 +135,12 @@ export class Game {
 
   getSoundEffects(): number {
     return this.gameState.soundeffects;
+  }
+
+  // Exposes the ruleset's live creature list, if it has one (Lynx does; see
+  // LynxLogic.activeCreatures). Returns [] for rulesets that don't expose
+  // one, matching the oracle harness's own MS-ruleset behavior.
+  getCreatures(): Creature[] {
+    return this.logic.activeCreatures ? this.logic.activeCreatures() : [];
   }
 }

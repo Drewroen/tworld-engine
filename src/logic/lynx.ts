@@ -338,6 +338,17 @@ export class LynxLogic implements RulesetLogic {
     this.state = state;
   }
 
+  /* Returns the live, active portion of the creature list (indices
+   * [0, crEndIndex)), equivalent to walking the C creaturelist() macro's
+   * array up to its Nothing-id (0) sentinel. Exposed for test/diagnostic
+   * code (e.g. the oracle differential digest dumper) that needs to mirror
+   * exactly what the C harness's printDigest() walks; not used by the
+   * engine's own logic, which always goes through crEndIndex directly.
+   */
+  activeCreatures(): Creature[] {
+    return this.state.creatures.slice(0, this.crEndIndex);
+  }
+
   /*
    * Simple field accessors. (lxlogic.c:90-146)
    *
