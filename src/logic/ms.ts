@@ -99,6 +99,16 @@ import {
   NIL,
   NORTH,
   Ruleset,
+  SND_BOMB_EXPLODES,
+  SND_BOOTS_STOLEN,
+  SND_BUTTON_PUSHED,
+  SND_CANT_MOVE,
+  SND_DOOR_OPENED,
+  SND_IC_COLLECTED,
+  SND_ITEM_COLLECTED,
+  SND_SOCKET_OPENED,
+  SND_TELEPORTING,
+  SND_WATER_SPLASH,
   SOUTH,
   WEST,
   crtile,
@@ -1438,15 +1448,451 @@ export class MsLogic implements RulesetLogic {
     }
   }
 
+  /* addsoundeffect() macro (mslogic.c, via gen.h) — sets the given sound
+   * effect's bit in the game state's sound-effects bitmask. Mirrors
+   * lynx.ts's own addSoundEffect() helper.
+   */
+  private addSoundEffect(sfx: number): void {
+    this.state.soundeffects |= 1 << sfx;
+  }
+
   /*
-   * Stubs for later sub-dispatches.
+   * Buttons, clone machines, and bear traps. (mslogic.c:1447-1553)
    */
 
-  /* The central creature-movement function. Not yet implemented — a later
-   * sub-dispatch fills this in. (mslogic.c forward-declared at line 32)
+  /* Activate the clone machine wired to the given button, if any.
+   * (mslogic.c:1447-1478)
    */
+  private activateCloner(buttonPos: number): void {
+    const pos = this.clonerFromButton(buttonPos);
+    if (pos < 0 || pos >= CXGRID * CYGRID) return;
+    const tileId = this.state.cellAt(pos).top.id;
+    if (!iscreature(tileId) || creatureid(tileId) === Tile.Chip) return;
+    if (creatureid(tileId) === Tile.Block) {
+      const cr = this.lookupBlock(pos);
+      if (cr.dir !== NIL) this.advanceCreature(cr, cr.dir);
+    } else {
+      if (this.state.cellAt(pos).bot.state & FS_CLONING) return;
+      const dummy: Creature = {
+        id: creatureid(tileId),
+        pos,
+        dir: creaturedirid(tileId),
+        tdir: NIL,
+        state: 0,
+        frame: 0,
+        hidden: false,
+        moving: 0,
+      };
+      if (!this.canMakeMove(dummy, dummy.dir, CMM_CLONECANTBLOCK)) return;
+      const cr = this.awakenCreature(pos);
+      if (!cr) return;
+      cr.state |= CS_CLONING;
+      if (this.state.cellAt(pos).bot.id === Tile.CloneMachine)
+        this.state.cellAt(pos).bot.state |= FS_CLONING;
+    }
+  }
+
+  /* Open a bear trap. Any creature already in the trap is released.
+   * (mslogic.c:1482-1504)
+   */
+  private springTrap(buttonPos: number): void {
+    const pos = this.trapFromButton(buttonPos);
+    if (pos < 0) return;
+    if (pos >= CXGRID * CYGRID) {
+      console.warn(
+        `Off-map trap opening attempted: (${pos % CXGRID} ${Math.floor(pos / CXGRID)})`,
+      );
+      return;
+    }
+    const id = this.state.cellAt(pos).top.id;
+    if (id === Tile.Block_Static || this.state.cellAt(pos).bot.state & FS_HASMUTANT) {
+      const cr = this.lookupBlock(pos);
+      if (cr) cr.state |= CS_RELEASED;
+    } else if (iscreature(id)) {
+      const cr = this.lookupCreature(pos, true);
+      if (cr) cr.state |= CS_RELEASED;
+    }
+  }
+
+  /* Mark all buttons everywhere as having been handled. (mslogic.c:1508-1515) */
+  private resetButtons(): void {
+    for (let pos = 0; pos < CXGRID * CYGRID; ++pos) {
+      const cell = this.state.cellAt(pos);
+      cell.top.state &= ~FS_BUTTONDOWN;
+      cell.bot.state &= ~FS_BUTTONDOWN;
+    }
+  }
+
+  /* Apply the effects of all deferred button presses, if any.
+   * (mslogic.c:1519-1553)
+   */
+  private handleButtons(): void {
+    for (let pos = 0; pos < CXGRID * CYGRID; ++pos) {
+      const cell = this.state.cellAt(pos);
+      let id: number;
+      if (cell.top.state & FS_BUTTONDOWN) {
+        cell.top.state &= ~FS_BUTTONDOWN;
+        id = cell.top.id;
+      } else if (cell.bot.state & FS_BUTTONDOWN) {
+        cell.bot.state &= ~FS_BUTTONDOWN;
+        id = cell.bot.id;
+      } else {
+        continue;
+      }
+      switch (id) {
+        case Tile.Button_Blue:
+          this.addSoundEffect(SND_BUTTON_PUSHED);
+          this.turnTanks(null);
+          break;
+        case Tile.Button_Green:
+          this.toggleWalls();
+          break;
+        case Tile.Button_Red:
+          this.activateCloner(pos);
+          this.addSoundEffect(SND_BUTTON_PUSHED);
+          break;
+        case Tile.Button_Brown:
+          this.springTrap(pos);
+          this.addSoundEffect(SND_BUTTON_PUSHED);
+          break;
+        default:
+          console.warn(`Fooey! Tile ${id.toString(16).toUpperCase()} is not a button!`);
+          break;
+      }
+    }
+  }
+
+  /*
+   * When something actually moves. (mslogic.c:1555-1891)
+   */
+
+  /* Initiate a move by the given creature in the given direction. Return
+   * FALSE if the creature cannot initiate the indicated move (side effects
+   * may still occur). The `_assert(dir != NIL)` is omitted per the
+   * established no-op-assertion convention (the caller — advanceCreature()
+   * — already returns early on dir===NIL before ever reaching this
+   * function). (mslogic.c:1563-1589)
+   */
+  private startMovement(cr: Creature, dir: number): boolean {
+    const odir = cr.dir; /* b2 fix with convergence glitch */
+
+    const floor = this.state.cellAt(cr.pos).bot.id;
+    if (!this.canMakeMove(cr, dir, 0)) {
+      if (
+        cr.id === Tile.Chip ||
+        (floor !== Tile.Beartrap && floor !== Tile.CloneMachine && !(cr.state & CS_SLIP))
+      ) {
+        if (cr.id !== Tile.Chip || odir !== NIL) cr.dir = dir; /* b2 fix */
+        this.updateCreature(cr);
+      }
+      return false;
+    }
+
+    if (floor === Tile.Beartrap) {
+      if (cr.state & CS_MUTANT) this.state.cellAt(cr.pos).bot.state &= ~FS_HASMUTANT;
+    }
+    cr.state &= ~CS_RELEASED;
+
+    cr.dir = dir;
+
+    return true;
+  }
+
+  /* Complete the movement of the given creature. Most side effects
+   * produced by moving onto a tile occur at this point. This function is
+   * also the only place where a creature can be added to the slip list.
+   *
+   * Judgment call on the "Convergence Patch" `if (TRUE || newpos != i)`
+   * below: mirroring the established convention for the dead
+   * `if (FALSE && ...)` block in chooseCreatureMove() (see that method's
+   * design note), this is transcribed as a literal `if (true || ...)`
+   * rather than simplified to an unconditional block — the point of the
+   * literal transcription is to preserve, in the same relative position, a
+   * visible marker of the fact that the `newpos !== i` half of the
+   * condition is dead code the original author left in deliberately,
+   * along with the "no idea, but Icysanity lvl 1 requires newpos=i to
+   * work" comment that documents why. The large block of old, commented-
+   * out code inside this branch (`cr->dir = NORTH; cellat(newpos)->top.id
+   * = crtile(Chip, NORTH);`) is pure history/documentation in the C
+   * source and is omitted here rather than reproduced as a TS comment.
+   * (mslogic.c:1596-1866)
+   */
+  private endMovement(cr: Creature, dir: number): void {
+    const delta = [0, -CXGRID, -1, 0, +CXGRID, 0, 0, 0, +1];
+    let dead = false;
+
+    const oldPos = cr.pos;
+    let newPos = cr.pos + delta[dir]!;
+
+    const cell = this.state.cellAt(newPos);
+    let tile = cell.top;
+    let floor = tile.id;
+    const crid = creatureid(this.state.cellAt(oldPos).top.id); /* Non-existence patch */
+    let blockCloning = false; /* Squish patch */
+
+    if (cr.id === Tile.Chip) {
+      switch (floor) {
+        case Tile.Empty:
+          this.popTile(newPos);
+          break;
+        case Tile.Water:
+          if (!this.getPossession(Tile.Boots_Water))
+            this.state.msstate.chipstatus = ChipStatus.CHIP_DROWNED;
+          break;
+        case Tile.Fire:
+          if (!this.getPossession(Tile.Boots_Fire))
+            this.state.msstate.chipstatus = ChipStatus.CHIP_BURNED;
+          break;
+        case Tile.Dirt:
+          this.popTile(newPos);
+          break;
+        case Tile.BlueWall_Fake:
+          this.popTile(newPos);
+          break;
+        case Tile.PopupWall:
+          tile.id = Tile.Wall;
+          break;
+        case Tile.Door_Red:
+        case Tile.Door_Blue:
+        case Tile.Door_Yellow:
+        case Tile.Door_Green:
+          if (floor !== Tile.Door_Green)
+            this.setPossession(floor, this.getPossession(floor) - 1);
+          this.popTile(newPos);
+          this.addSoundEffect(SND_DOOR_OPENED);
+          break;
+        case Tile.Boots_Ice:
+        case Tile.Boots_Slide:
+        case Tile.Boots_Fire:
+        case Tile.Boots_Water:
+        case Tile.Key_Red:
+        case Tile.Key_Blue:
+        case Tile.Key_Yellow:
+        case Tile.Key_Green:
+          if (iscreature(cell.bot.id)) this.state.msstate.chipstatus = ChipStatus.CHIP_COLLIDED;
+          this.setPossession(floor, this.getPossession(floor) + 1);
+          this.popTile(newPos);
+          this.addSoundEffect(SND_ITEM_COLLECTED);
+          break;
+        case Tile.Burglar:
+          this.state.boots[0] = 0;
+          this.state.boots[1] = 0;
+          this.state.boots[2] = 0;
+          this.state.boots[3] = 0;
+          this.addSoundEffect(SND_BOOTS_STOLEN);
+          break;
+        case Tile.ICChip:
+          if (this.state.chipsneeded) --this.state.chipsneeded;
+          this.popTile(newPos);
+          this.addSoundEffect(SND_IC_COLLECTED);
+          break;
+        case Tile.Socket:
+          this.popTile(newPos);
+          this.addSoundEffect(SND_SOCKET_OPENED);
+          break;
+        case Tile.Bomb:
+          this.state.msstate.chipstatus = ChipStatus.CHIP_BOMBED;
+          this.addSoundEffect(SND_BOMB_EXPLODES);
+          break;
+        default:
+          if (iscreature(floor)) this.state.msstate.chipstatus = ChipStatus.CHIP_COLLIDED;
+          break;
+      }
+    } else if (cr.id === Tile.Block) {
+      switch (floor) {
+        case Tile.Empty:
+          this.popTile(newPos);
+          break;
+        case Tile.Water:
+          tile.id = Tile.Dirt;
+          dead = true;
+          this.addSoundEffect(SND_WATER_SPLASH);
+          break;
+        case Tile.Bomb:
+          tile.id = Tile.Empty;
+          dead = true;
+          this.addSoundEffect(SND_BOMB_EXPLODES);
+          break;
+        case Tile.Teleport:
+          if (!(tile.state & FS_BROKEN)) newPos = this.teleportCreature(cr, newPos);
+          break;
+      }
+      const id = this.state.cellAt(oldPos).top.id;
+      if (iscreature(id) && creatureid(id) === Tile.Chip) cr.state |= CS_MUTANT;
+    } else {
+      if (iscreature(cell.top.id)) {
+        tile = cell.bot;
+        floor = cell.bot.id;
+      }
+      switch (floor) {
+        case Tile.Water:
+          if (crid !== Tile.Glider) /* use crid with Non-existence patch */ dead = true;
+          break;
+        case Tile.Fire:
+          if (crid !== Tile.Fireball) /* use crid with Non-existence patch */ dead = true;
+          break;
+        case Tile.Bomb:
+          cell.top.id = Tile.Empty;
+          dead = true;
+          this.addSoundEffect(SND_BOMB_EXPLODES);
+          break;
+        case Tile.Teleport:
+          if (!(tile.state & FS_BROKEN)) newPos = this.teleportCreature(cr, newPos);
+          break;
+      }
+    }
+
+    if (this.state.cellAt(oldPos).bot.id !== Tile.CloneMachine || cr.id === Tile.Chip)
+      this.popTile(oldPos);
+    if (dead) {
+      this.removeCreature(cr);
+      if (this.state.cellAt(oldPos).bot.id === Tile.CloneMachine)
+        this.state.cellAt(oldPos).bot.state &= ~FS_CLONING;
+      return;
+    }
+
+    if (cr.id === Tile.Chip && floor === Tile.Teleport && !(tile.state & FS_BROKEN)) {
+      const i = newPos;
+      newPos = this.teleportCreature(cr, newPos);
+      if (true || newPos !== i) {
+        /* Convergence Patch: no idea, but Icysanity lvl 1 requires
+         * newpos=i to work. */
+        this.addSoundEffect(SND_TELEPORTING);
+        if (this.floorAt(newPos) === Tile.Block_Static) {
+          if (this.state.msstate.lastslipdir === NIL) {
+            /* these seem cosmetic/superfluous with new patch:
+             * cr.dir = NORTH; cellat(newpos).top.id = crtile(Chip, NORTH); */
+            cr.dir = NIL; /* Convergence Patch */
+          } else {
+            /* seems ok still, with new Convergence logic */
+            cr.dir = this.state.msstate.lastslipdir;
+          }
+        }
+      }
+    }
+
+    cr.pos = newPos;
+    this.addCreatureToMap(cr);
+    cr.pos = oldPos;
+
+    tile = cell.bot;
+    switch (floor) {
+      case Tile.Button_Blue:
+        if (cr.state & CS_DEFERPUSH) tile.state |= FS_BUTTONDOWN;
+        else this.turnTanks(cr);
+        this.addSoundEffect(SND_BUTTON_PUSHED);
+        break;
+      case Tile.Button_Green:
+        if (cr.state & CS_DEFERPUSH) tile.state |= FS_BUTTONDOWN;
+        else this.toggleWalls();
+        break;
+      case Tile.Button_Red:
+        cr.moving = 1; /* Hack with SGG */
+        if (cr.state & CS_DEFERPUSH) tile.state |= FS_BUTTONDOWN;
+        else this.activateCloner(newPos);
+        this.addSoundEffect(SND_BUTTON_PUSHED);
+        cr.moving = 0; /* Hack with SGG */
+        break;
+      case Tile.Button_Brown:
+        if (cr.state & CS_DEFERPUSH) tile.state |= FS_BUTTONDOWN;
+        else this.springTrap(newPos);
+        this.addSoundEffect(SND_BUTTON_PUSHED);
+        break;
+    }
+    cr.pos = newPos;
+
+    if (
+      this.state.cellAt(oldPos).bot.id === Tile.CloneMachine &&
+      cr.id === Tile.Block &&
+      this.state.cellAt(oldPos).top.id !== Tile.Block_Static
+    )
+      blockCloning = true; /* Squish patch */
+
+    if (this.state.cellAt(oldPos).bot.id === Tile.CloneMachine)
+      this.state.cellAt(oldPos).bot.state &= ~FS_CLONING;
+
+    if (floor === Tile.Beartrap) {
+      if (this.isTrapOpen(newPos, oldPos)) cr.state |= CS_RELEASED;
+    } else if (this.state.cellAt(newPos).bot.id === Tile.Beartrap) {
+      for (let i = 0; i < this.state.trapcount; ++i) {
+        const trap = this.state.traps[i];
+        if (trap && trap.to === newPos) {
+          cr.state |= CS_RELEASED;
+          break;
+        }
+      }
+    }
+
+    if (cr.id === Tile.Chip) {
+      if (this.state.msstate.goalpos === cr.pos) this.cancelGoal();
+      if (
+        this.state.msstate.chipstatus !== ChipStatus.CHIP_OKAY &&
+        this.state.msstate.chipstatus !== ChipStatus.CHIP_SQUISHED
+      )
+        return; /* CHIP_SQUISHED added with Squish patch */
+      if (cell.bot.id === Tile.Exit) {
+        this.state.msstate.completed = 1;
+        return;
+      }
+    } else {
+      if (iscreature(cell.bot.id)) {
+        if (
+          creatureid(cell.bot.id) === Tile.Chip ||
+          creatureid(cell.bot.id) === Tile.Swimming_Chip
+        ) {
+          if (cr.id !== Tile.Block || !blockCloning) /* Squish patch */
+            this.state.msstate.chipstatus = ChipStatus.CHIP_COLLIDED;
+          else this.state.msstate.chipstatus = ChipStatus.CHIP_SQUISHED; /* Squish patch */
+          return;
+        }
+      }
+    }
+
+    const wasSlipping = cr.state & (CS_SLIP | CS_SLIDE);
+
+    if (floor === Tile.Teleport) {
+      this.startFloorMovement(cr, floor, NIL); /* NIL for tank reversal patch */
+    } else if (isice(floor) && (cr.id !== Tile.Chip || !this.getPossession(Tile.Boots_Ice))) {
+      this.startFloorMovement(cr, floor, NIL); /* NIL for tank reversal patch */
+    } else if (
+      isslide(floor) &&
+      (cr.id !== Tile.Chip || !this.getPossession(Tile.Boots_Slide))
+    ) {
+      this.startFloorMovement(cr, floor, NIL); /* NIL for tank reversal patch */
+    } else if (floor === Tile.Beartrap && cr.id === Tile.Block && wasSlipping) {
+      this.startFloorMovement(cr, floor, NIL); /* NIL for tank reversal patch */
+      if (cr.state & CS_MUTANT) cell.bot.state |= FS_HASMUTANT;
+    } else {
+      /* changes for MSCC-style sliplist */
+      cr.state &= ~(CS_SLIP | CS_SLIDE);
+      if (wasSlipping && cr.id !== Tile.Chip) {
+        this.slipperCount--;
+        this.removeFromSlipList(cr);
+      }
+    }
+    if (!wasSlipping && cr.state & (CS_SLIP | CS_SLIDE) && cr.id !== Tile.Chip)
+      this.state.msstate.controllerdir = this.getSlipDir(cr);
+  }
+
+  /* Move the given creature in the given direction. (mslogic.c:1870-1891) */
   private advanceCreature(cr: Creature, dir: number): number {
-    throw new Error("MsLogic.advanceCreature: not yet implemented");
+    if (dir === NIL) return 1;
+
+    if (cr.id === Tile.Chip) this.state.msstate.chipwait = 0;
+
+    if (!this.startMovement(cr, dir)) {
+      if (cr.id === Tile.Chip) {
+        this.addSoundEffect(SND_CANT_MOVE);
+        this.resetButtons();
+        this.cancelGoal();
+      }
+      return 0;
+    }
+
+    this.endMovement(cr, dir);
+    if (cr.id === Tile.Chip) this.handleButtons();
+
+    return 1;
   }
 
   initGame(): boolean {
