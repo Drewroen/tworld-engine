@@ -83,9 +83,19 @@
 
 import {
   back,
+  CmdAbsMouseMoveFirst,
+  CmdAbsMouseMoveLast,
+  CmdMouseMoveFirst,
+  CmdMouseMoveLast,
+  CmdMoveNop,
   CXGRID,
   CYGRID,
+  diridx,
   EAST,
+  isdoor,
+  left,
+  MOUSERANGE,
+  MOUSERANGEMIN,
   NIL,
   NORTH,
   Ruleset,
@@ -953,6 +963,479 @@ export class MsLogic implements RulesetLogic {
       }
     }
     return r;
+  }
+
+  /*
+   * How everyone selects their move. (mslogic.c:992-1443)
+   */
+
+  /* hasgoal()/cancelgoal() macros (mslogic.c:91-93): the goal position is
+   * "unset" when negative.
+   */
+  private hasGoal(): boolean {
+    return this.state.msstate.goalpos >= 0;
+  }
+
+  private cancelGoal(): void {
+    this.state.msstate.goalpos = -1;
+  }
+
+  /* The central function determining whether a creature is permitted to
+   * move in a given direction. See the design notes accompanying this
+   * dispatch for a summary of the several documented historical quirks
+   * preserved verbatim below (the reveal-and-deny HiddenWall_Temp/
+   * BlueWall_Real pattern, the two "totally backwards" block-pushing
+   * checks, and the turning-tank cloning patch). (mslogic.c:992-1107)
+   */
+  private canMakeMove(cr: Creature, dir: number, flags: number): boolean {
+    let y = Math.floor(cr.pos / CXGRID);
+    let x = cr.pos % CXGRID;
+    y += dir === NORTH ? -1 : dir === SOUTH ? 1 : 0;
+    x += dir === WEST ? -1 : dir === EAST ? 1 : 0;
+    if (y < 0 || y >= CYGRID || x < 0 || x >= CXGRID) return false;
+    const to = y * CXGRID + x;
+
+    if (!(flags & CMM_NOLEAVECHECK)) {
+      switch (this.state.cellAt(cr.pos).bot.id) {
+        case Tile.Wall_North:
+          if (dir === NORTH) return false;
+          break;
+        case Tile.Wall_West:
+          if (dir === WEST) return false;
+          break;
+        case Tile.Wall_South:
+          if (dir === SOUTH) return false;
+          break;
+        case Tile.Wall_East:
+          if (dir === EAST) return false;
+          break;
+        case Tile.Wall_Southeast:
+          if (dir & (SOUTH | EAST)) return false;
+          break;
+        case Tile.Beartrap:
+          if (!(cr.state & CS_RELEASED)) return false;
+          break;
+      }
+    }
+
+    let floor: number;
+    let id: number;
+
+    if (cr.id === Tile.Chip) {
+      floor = this.floorAt(to);
+      if (!(movelaws[floor]!.chip & dir)) return false;
+      if (floor === Tile.Socket && this.state.chipsneeded > 0) return false;
+      if (isdoor(floor) && !this.getPossession(floor)) return false;
+      if (iscreature(this.state.cellAt(to).top.id)) {
+        id = creatureid(this.state.cellAt(to).top.id);
+        if (id === Tile.Chip || id === Tile.Swimming_Chip || id === Tile.Block)
+          return false;
+      }
+      if (floor === Tile.HiddenWall_Temp || floor === Tile.BlueWall_Real) {
+        if (!(flags & CMM_NOEXPOSEWALLS)) this.getFloorAt(to).id = Tile.Wall;
+        return false;
+      }
+      if (floor === Tile.Block_Static) {
+        if (!this.pushBlock(to, dir, flags)) return false;
+        else if (flags & CMM_NOPUSHING) return false;
+        if (this.state.cellAt(to).bot.id === Tile.CloneMachine)
+          return false; /* totally backwards: need to check this first */
+        if (flags & CMM_TELEPORTPUSH && this.floorAt(to) === Tile.Block_Static)
+          /* totally backwards: remove "&& cellat(to)->bot.id == Empty)" */
+          return true;
+        return this.canMakeMove(cr, dir, flags | CMM_NOPUSHING);
+      }
+    } else if (cr.id === Tile.Block) {
+      floor = this.state.cellAt(to).top.id;
+      if (iscreature(floor)) {
+        id = creatureid(floor);
+        return id === Tile.Chip || id === Tile.Swimming_Chip;
+      }
+      if (!(movelaws[floor]!.block & dir)) return false;
+    } else {
+      floor = this.state.cellAt(to).top.id;
+      if (iscreature(floor)) {
+        id = creatureid(floor);
+        if (id === Tile.Chip || id === Tile.Swimming_Chip) {
+          floor = this.state.cellAt(to).bot.id;
+          if (iscreature(floor)) {
+            id = creatureid(floor);
+            return id === Tile.Chip || id === Tile.Swimming_Chip;
+          }
+        }
+      }
+      if (iscreature(floor)) {
+        /* turning tank cloning patch */
+        const F = this.lookupCreature(to, false);
+        if (!(flags & CMM_CLONECANTBLOCK)) return false; /* not cloning */
+        if (
+          (F === null || !(F.state & CS_TURNING)) &&
+          floor === crtile(cr.id, cr.dir)
+        )
+          return true;
+        /* must check "floor", so same-dir non-creature tank will clone */
+        if (F === null) return false;
+        if (F.dir === cr.dir) return true;
+        return false;
+      }
+      if (!(movelaws[floor]!.creature & dir)) return false;
+      if (floor === Tile.Fire && (cr.id === Tile.Bug || cr.id === Tile.Walker))
+        if (!(flags & CMM_NOFIRECHECK)) return false;
+    }
+
+    if (this.state.cellAt(to).bot.id === Tile.CloneMachine) return false;
+
+    return true;
+  }
+
+  /* This function embodies the movement behavior of all the creatures.
+   * Given a creature, this function enumerates its desired direction of
+   * movement and selects the first one that is permitted. Note that
+   * calling this function also updates the current controller direction.
+   *
+   * Judgment call on the dead `if (FALSE && ...)` sub-block below (the
+   * "stalled tank" (0,0)-move-success hack): the C source's `FALSE &&`
+   * short-circuits before ever evaluating the rest of the condition,
+   * making the whole `if` body permanently unreachable — this is
+   * documented, deliberately-inert code left in place by the original
+   * author (see the "Actually, successful (0,0) moves don't kill Chip"
+   * comment immediately after it, which explains why it was disabled).
+   * It is transcribed here as a literal `if (false && ...)` block (rather
+   * than omitted) so a reader diffing against mslogic.c line-for-line can
+   * still find it in the same relative position; TypeScript's own
+   * short-circuit evaluation makes it exactly as dead as the C version.
+   * (mslogic.c:1119-1282)
+   */
+  private chooseCreatureMove(cr: Creature): void {
+    const choices: number[] = [NIL, NIL, NIL, NIL];
+    let dir: number;
+    let pdir: number;
+    let floor: number;
+    let y: number;
+    let x: number;
+    let m: number;
+    let n: number;
+
+    cr.tdir = NIL;
+
+    if (cr.hidden) return;
+    if (cr.id === Tile.Block) return;
+    if (this.state.currenttime & 2) return;
+    if (cr.id === Tile.Teeth || cr.id === Tile.Blob) {
+      if ((this.state.currenttime + this.state.stepping) & 4) return;
+    }
+    if (cr.state & CS_TURNING) {
+      cr.state &= ~(CS_TURNING | CS_HASMOVED);
+      this.updateCreature(cr);
+    }
+    if (cr.state & CS_HASMOVED) {
+      /* should be a stalled tank */
+      let sfloor = this.state.cellAt(cr.pos).top.id; /* stacked tank patch */
+      const id = creatureid(sfloor);
+      if (iscreature(sfloor) && (id === Tile.Chip || id === Tile.Swimming_Chip))
+        sfloor = this.state.cellAt(cr.pos).bot.id;
+      if (!iscreature(sfloor) && movelaws[sfloor]!.creature)
+        cr.hidden = true; /* hack with (0,0) movement success */
+      /* maybe should check if (0,0) move goes on sliplist, but that's UB */
+      if (
+        false &&
+        cr.hidden &&
+        (id === Tile.Chip || id === Tile.Swimming_Chip) &&
+        sfloor !== Tile.Fire &&
+        sfloor !== Tile.Water &&
+        sfloor !== Tile.Bomb
+      ) {
+        this.state.msstate.chipstatus = ChipStatus.CHIP_COLLIDED;
+        this.state.cellAt(cr.pos).bot.id = this.state.cellAt(cr.pos).top.id;
+        this.state.cellAt(cr.pos).top.id = Tile.Tank + diridx(cr.dir);
+      } /* Actually, successful (0,0) moves don't kill Chip */
+    }
+    if (cr.state & CS_HASMOVED) {
+      this.state.msstate.controllerdir = NIL;
+      return;
+    }
+    if (cr.state & (CS_SLIP | CS_SLIDE)) return;
+
+    floor = this.floorAt(cr.pos);
+
+    pdir = dir = cr.dir;
+
+    if (floor === Tile.CloneMachine || floor === Tile.Beartrap) {
+      switch (cr.id) {
+        case Tile.Tank:
+        case Tile.Ball:
+        case Tile.Glider:
+        case Tile.Fireball:
+        case Tile.Walker:
+          choices[0] = dir;
+          break;
+        case Tile.Blob:
+          choices[0] = dir;
+          choices[1] = left(dir);
+          choices[2] = back(dir);
+          choices[3] = right(dir);
+          this.state.mainprng.randomP4(choices);
+          break;
+        case Tile.Bug:
+        case Tile.Paramecium:
+        case Tile.Teeth:
+          choices[0] = this.state.msstate.controllerdir;
+          cr.tdir = this.state.msstate.controllerdir;
+          return;
+        default:
+          console.warn(
+            `Non-creature ${cr.id.toString(16).toUpperCase()} trying to move`,
+          );
+          break;
+      }
+    } else {
+      switch (cr.id) {
+        case Tile.Tank:
+          choices[0] = dir;
+          break;
+        case Tile.Ball:
+          choices[0] = dir;
+          choices[1] = back(dir);
+          break;
+        case Tile.Glider:
+          choices[0] = dir;
+          choices[1] = left(dir);
+          choices[2] = right(dir);
+          choices[3] = back(dir);
+          break;
+        case Tile.Fireball:
+          choices[0] = dir;
+          choices[1] = right(dir);
+          choices[2] = left(dir);
+          choices[3] = back(dir);
+          break;
+        case Tile.Walker: {
+          choices[0] = dir;
+          choices[1] = left(dir);
+          choices[2] = back(dir);
+          choices[3] = right(dir);
+          const sub = [choices[1]!, choices[2]!, choices[3]!];
+          this.state.mainprng.randomP3(sub);
+          choices[1] = sub[0]!;
+          choices[2] = sub[1]!;
+          choices[3] = sub[2]!;
+          break;
+        }
+        case Tile.Blob:
+          choices[0] = dir;
+          choices[1] = left(dir);
+          choices[2] = back(dir);
+          choices[3] = right(dir);
+          this.state.mainprng.randomP4(choices);
+          break;
+        case Tile.Bug:
+          choices[0] = left(dir);
+          choices[1] = dir;
+          choices[2] = right(dir);
+          choices[3] = back(dir);
+          break;
+        case Tile.Paramecium:
+          choices[0] = right(dir);
+          choices[1] = dir;
+          choices[2] = left(dir);
+          choices[3] = back(dir);
+          break;
+        case Tile.Teeth: {
+          y = Math.floor(this.chipPos() / CXGRID) - Math.floor(cr.pos / CXGRID);
+          x = (this.chipPos() % CXGRID) - (cr.pos % CXGRID);
+          n = y < 0 ? NORTH : y > 0 ? SOUTH : NIL;
+          if (y < 0) y = -y;
+          m = x < 0 ? WEST : x > 0 ? EAST : NIL;
+          if (x < 0) x = -x;
+          if (x > y) {
+            choices[0] = m;
+            choices[1] = n;
+          } else {
+            choices[0] = n;
+            choices[1] = m;
+          }
+          pdir = choices[2] = choices[0]!;
+          break;
+        }
+        default:
+          console.warn(
+            `Non-creature ${cr.id.toString(16).toUpperCase()} trying to move`,
+          );
+          break;
+      }
+    }
+
+    for (n = 0; n < 4 && choices[n] !== NIL; ++n) {
+      cr.tdir = choices[n]!;
+      this.state.msstate.controllerdir = cr.tdir;
+      if (this.canMakeMove(cr, choices[n]!, 0)) return;
+    }
+
+    if (cr.id === Tile.Tank) {
+      if (
+        cr.state & CS_RELEASED ||
+        floor !== Tile.Beartrap /*&& floor != CloneMachine*/
+      )
+        /* (c) bug: tank clones should stall */
+        cr.state |= CS_HASMOVED;
+      cr.tdir = NIL; /* handle stacked tanks */
+    }
+
+    if (cr.id !== Tile.Tank)
+      /* handle stacked tanks */
+      cr.tdir = pdir;
+  }
+
+  /* Select a direction for Chip to move towards the goal position.
+   * (mslogic.c:1286-1318)
+   */
+  private chipMoveToGoalPos(): number {
+    if (!this.hasGoal()) return NIL;
+    const cr = this.getChip();
+    if (this.state.msstate.goalpos === cr.pos) {
+      this.cancelGoal();
+      return NIL;
+    }
+
+    let y =
+      Math.floor(this.state.msstate.goalpos / CXGRID) -
+      Math.floor(cr.pos / CXGRID);
+    let x = (this.state.msstate.goalpos % CXGRID) - (cr.pos % CXGRID);
+    let d1 = y < 0 ? NORTH : y > 0 ? SOUTH : NIL;
+    if (y < 0) y = -y;
+    let d2 = x < 0 ? WEST : x > 0 ? EAST : NIL;
+    if (x < 0) x = -x;
+    if (x > y) {
+      const dir = d1;
+      d1 = d2;
+      d2 = dir;
+    }
+
+    let dir: number;
+    if (d1 !== NIL && d2 !== NIL) dir = this.canMakeMove(cr, d1, 0) ? d1 : d2;
+    else dir = d2 === NIL ? d1 : d2;
+
+    return dir;
+  }
+
+  /* Translate a map position into a packed location relative to Chip.
+   * (mslogic.c:1322-1330)
+   */
+  private makeMouseRelative(absPos: number): number {
+    const x = (absPos % CXGRID) - (this.chipPos() % CXGRID);
+    const y =
+      Math.floor(absPos / CXGRID) - Math.floor(this.chipPos() / CXGRID);
+    return (y - MOUSERANGEMIN) * MOUSERANGE + (x - MOUSERANGEMIN);
+  }
+
+  /* Unpack a Chip-relative map location. (mslogic.c:1334-1340) */
+  private makeMouseAbsolute(relPos: number): number {
+    const x = (relPos % MOUSERANGE) + MOUSERANGEMIN;
+    const y = Math.floor(relPos / MOUSERANGE) + MOUSERANGEMIN;
+    return this.chipPos() + y * CXGRID + x;
+  }
+
+  /* Determine the direction of Chip's next move. If discard is true, then
+   * Chip is not currently permitted to select a direction of movement,
+   * and the player's input should not be retained. (mslogic.c:1346-1390)
+   */
+  private chooseChipMove(cr: Creature, discard: boolean): void {
+    cr.tdir = NIL;
+
+    if (cr.hidden) return;
+
+    if (!(this.state.currenttime & 3)) cr.state &= ~CS_HASMOVED;
+    if (cr.state & CS_HASMOVED) {
+      if (this.state.currentinput !== NIL && this.hasGoal()) {
+        this.cancelGoal();
+        this.state.lastmove = CmdMoveNop;
+      }
+      return;
+    }
+
+    let dir = this.state.currentinput;
+    this.state.currentinput = NIL;
+    if (discard || ((cr.state & CS_SLIDE) !== 0 && dir === cr.dir)) {
+      if (this.state.currenttime && !(this.state.currenttime & 1))
+        this.cancelGoal();
+      return;
+    }
+
+    if (dir >= CmdAbsMouseMoveFirst && dir <= CmdAbsMouseMoveLast) {
+      this.state.msstate.goalpos = dir - CmdAbsMouseMoveFirst;
+      this.state.lastmove =
+        CmdMouseMoveFirst + this.makeMouseRelative(this.state.msstate.goalpos);
+      dir = NIL;
+    } else if (dir >= CmdMouseMoveFirst && dir <= CmdMouseMoveLast) {
+      this.state.lastmove = dir;
+      this.state.msstate.goalpos = this.makeMouseAbsolute(
+        dir - CmdMouseMoveFirst,
+      );
+      dir = NIL;
+    } else {
+      if (dir & (NORTH | SOUTH) && dir & (EAST | WEST)) {
+        dir &= NORTH | SOUTH;
+      }
+      this.state.lastmove = dir;
+    }
+
+    if (dir === NIL && this.hasGoal() && (this.state.currenttime & 3) === 2)
+      dir = this.chipMoveToGoalPos();
+
+    cr.tdir = dir;
+  }
+
+  /* Teleport the given creature instantaneously from the teleport tile at
+   * start to another teleport tile (if possible). (mslogic.c:1395-1430)
+   */
+  private teleportCreature(cr: Creature, start: number): number {
+    const origdir = cr.dir; /* tank push IB onto blue button via teleporter */
+    if (cr.dir === NIL) {
+      console.warn(
+        `${this.state.currenttime}: directionless creature ` +
+          `${cr.id.toString(16).toUpperCase()} on teleport at ` +
+          `(${cr.pos % CXGRID} ${Math.floor(cr.pos / CXGRID)})`,
+      );
+      return NIL;
+    }
+
+    const origpos = cr.pos;
+    let dest = start;
+
+    for (;;) {
+      --dest;
+      if (dest < 0) dest += CXGRID * CYGRID;
+      if (dest === start) break;
+      const tile = this.state.cellAt(dest).top;
+      if (tile.id !== Tile.Teleport || tile.state & FS_BROKEN) continue;
+      cr.pos = dest;
+      const f = this.canMakeMove(
+        cr,
+        cr.dir,
+        CMM_NOLEAVECHECK |
+          CMM_NOEXPOSEWALLS |
+          CMM_NODEFERBUTTONS |
+          CMM_NOFIRECHECK |
+          CMM_TELEPORTPUSH,
+      );
+      cr.dir = origdir; /* tank push IB onto blue button via teleporter */
+      cr.pos = origpos;
+      if (f) break;
+    }
+
+    return dest;
+  }
+
+  /* Determine the move(s) a creature will make on the current tick.
+   * (mslogic.c:1434-1443)
+   */
+  private chooseMove(cr: Creature): void {
+    if (cr.id === Tile.Chip) {
+      this.chooseChipMove(cr, Boolean(cr.state & CS_SLIP));
+    } else {
+      if (cr.state & CS_SLIP) cr.tdir = NIL;
+      else this.chooseCreatureMove(cr);
+    }
   }
 
   /*

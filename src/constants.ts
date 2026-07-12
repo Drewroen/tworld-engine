@@ -194,4 +194,19 @@ export const MOUSERANGEMIN = -9;
 export const MOUSERANGEMAX = 9;
 export const MOUSERANGE = 19;
 
+/* Continuing the C enum (defs.h:70-90) after CmdKeyMoveLast: each value is
+ * the next integer after the preceding enumerator unless given an explicit
+ * initializer, exactly mirroring the C enum's own auto-increment.
+ * CmdKeyMoveLast = 15, so CmdMouseMoveFirst = 16.
+ */
+export const CmdMouseMoveFirst = CmdKeyMoveLast + 1;
+export const CmdMoveNop = CmdMouseMoveFirst - MOUSERANGEMIN * (MOUSERANGE + 1);
+export const CmdMouseMoveLast = CmdMouseMoveFirst + MOUSERANGE * MOUSERANGE - 1;
+export const CmdReservedFirst = CmdMouseMoveLast + 1;
+export const CmdReservedLast = 511;
+export const CmdAbsMouseMoveFirst = CmdReservedLast + 1;
+export const CmdAbsMouseMoveLast = CmdAbsMouseMoveFirst + CXGRID * CYGRID - 1;
+export const CmdMoveFirst = CmdKeyMoveFirst;
+export const CmdMoveLast = CmdAbsMouseMoveLast;
+
 export const directionalcmd = (cmd: number): boolean => ((cmd & ~CmdKeyMoveLast) === 0);
