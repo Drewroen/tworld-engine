@@ -81,6 +81,18 @@ import {
   SND_WATER_SPLASH,
   SND_BOMB_EXPLODES,
   SND_CHIP_LOSES,
+  SND_CANT_MOVE,
+  SND_TELEPORTING,
+  SND_TILE_EMPTIED,
+  SND_WALL_CREATED,
+  SND_DOOR_OPENED,
+  SND_ITEM_COLLECTED,
+  SND_BOOTS_STOLEN,
+  SND_IC_COLLECTED,
+  SND_SOCKET_OPENED,
+  SND_CHIP_WINS,
+  SND_TRAP_ENTERED,
+  SND_BUTTON_PUSHED,
 } from "../constants";
 import { GameState } from "../state";
 import type { Creature } from "../types";
@@ -1139,11 +1151,468 @@ export class LynxLogic implements RulesetLogic {
     this.state.lxstate.chiptocr = null;
   }
 
-  /* advancecreature() — not yet implemented; a later sub-step owns the
-   * real body (movement execution). Referenced by canPushBlock() above.
+  /*
+   * The movement-execution layer. (lxlogic.c:1070-1521)
+   */
+
+  /* Move a creature standing on a teleport tile to the next teleport tile
+   * (searching backwards through the map, with wraparound). Returns TRUE
+   * if the creature was successfully moved. (lxlogic.c:1070-1109)
+   */
+  private teleportCreature(cr: Creature): boolean {
+    const origpos = cr.pos;
+    let pos = origpos;
+
+    for (;;) {
+      --pos;
+      if (pos < 0) {
+        pos += CXGRID * CYGRID;
+      }
+      if (this.floorAt(pos) === Tile.Teleport) {
+        if (cr.id !== Tile.Chip) {
+          this.removeClaim(cr.pos);
+        }
+        cr.pos = pos;
+        if (!this.isLocationClaimed(pos) && this.canMakeMove(cr, cr.dir, 0)) {
+          break;
+        }
+        if (pos === origpos) {
+          if (cr.id === Tile.Chip) {
+            this.state.lxstate.stuck = 1;
+          } else {
+            this.claimLocation(cr.pos);
+          }
+          return false;
+        }
+      } else if (this.isMarkedTeleport(pos)) {
+        this.state.cellAt(pos).top.id = Tile.Teleport;
+        if (pos === this.chipPos()) {
+          this.getChip().hidden = true;
+        }
+      }
+    }
+
+    if (cr.id === Tile.Chip) {
+      this.addSoundEffect(SND_TELEPORTING);
+    } else {
+      this.claimLocation(cr.pos);
+    }
+    cr.state |= CS_TELEPORTED;
+    return true;
+  }
+
+  /* Release a creature currently inside a clone machine. If the creature
+   * successfully exits, a new clone is created to replace it.
+   * (lxlogic.c:1114-1144)
+   */
+  private activateCloner(pos: number): boolean {
+    if (pos < 0) return false;
+    if (pos >= CXGRID * CYGRID) {
+      console.warn(
+        `Off-map cloning attempted: (${pos % CXGRID} ${Math.floor(pos / CXGRID)})`,
+      );
+      return false;
+    }
+    if (this.floorAt(pos) !== Tile.CloneMachine) {
+      console.warn(
+        `Red button not connected to a clone machine at (${pos % CXGRID} ${Math.floor(pos / CXGRID)})`,
+      );
+      return false;
+    }
+    const cr = this.lookupCreature(pos, true);
+    if (!cr) return false;
+    const clone = this.newCreature();
+    if (!clone) {
+      return this.advanceCreature(cr, true) !== 0;
+    }
+
+    // *clone = *cr; — copy every field of the Creature struct.
+    clone.pos = cr.pos;
+    clone.id = cr.id;
+    clone.dir = cr.dir;
+    clone.moving = cr.moving;
+    clone.frame = cr.frame;
+    clone.hidden = cr.hidden;
+    clone.state = cr.state;
+    clone.tdir = cr.tdir;
+
+    if (this.advanceCreature(cr, true) <= 0) {
+      clone.hidden = true;
+      return false;
+    }
+    return true;
+  }
+
+  /* Release any creature on a beartrap at the given location.
+   * (lxlogic.c:1148-1167)
+   */
+  private springTrap(pos: number): void {
+    if (pos < 0) return;
+    if (pos >= CXGRID * CYGRID) {
+      console.warn(
+        `Off-map trap opening attempted: (${pos % CXGRID} ${Math.floor(pos / CXGRID)})`,
+      );
+      return;
+    }
+    if (!this.isMarkedBeartrap(pos)) {
+      console.warn(
+        `Brown button not connected to a beartrap at (${pos % CXGRID} ${Math.floor(pos / CXGRID)})`,
+      );
+      return;
+    }
+    const cr = this.lookupCreature(pos, true);
+    if (cr && cr.dir !== NIL) {
+      this.advanceCreature(cr, true);
+    }
+  }
+
+  /* Initiate a move by the given creature. The direction of movement is
+   * given by the tdir field, or the fdir field if tdir is NIL. releasing
+   * must be true if the creature is moving out of a bear trap or clone
+   * machine. +1 is returned if the creature succeeded in moving, 0 is
+   * returned if the move could not be initiated, and -1 is returned if
+   * the creature was killed in the attempt. (lxlogic.c:1180-1269)
+   */
+  private startMovement(cr: Creature, releasing: boolean): number {
+    let dir: number;
+    if (cr.tdir !== NIL) {
+      dir = cr.tdir;
+    } else if (this.getFDir(cr) !== NIL) {
+      dir = this.getFDir(cr);
+    } else {
+      return 0;
+    }
+
+    cr.dir = dir;
+    const floorfrom = this.floorAt(cr.pos);
+
+    if (cr.id === Tile.Chip) {
+      if (this.getPossession(Tile.Boots_Slide) === 0) {
+        if (isslide(floorfrom) && cr.tdir === NIL) {
+          cr.state |= CS_SLIDETOKEN;
+        } else if (!isice(floorfrom) || this.getPossession(Tile.Boots_Ice) !== 0) {
+          cr.state &= ~CS_SLIDETOKEN;
+        }
+      }
+    }
+
+    if (
+      !this.canMakeMove(
+        cr,
+        dir,
+        CMM_PUSHBLOCKSNOW |
+          CMM_CLEARANIMATIONS |
+          CMM_STARTMOVEMENT |
+          (releasing ? CMM_RELEASING : 0),
+      )
+    ) {
+      if (cr.id === Tile.Chip) {
+        if (!this.state.lxstate.couldntmove) {
+          this.state.lxstate.couldntmove = 1;
+          this.addSoundEffect(SND_CANT_MOVE);
+        }
+        this.state.lxstate.pushing = 1;
+      }
+      if (isice(floorfrom) && (cr.id !== Tile.Chip || this.getPossession(Tile.Boots_Ice) === 0)) {
+        cr.dir = back(dir);
+        this.applyIceWallTurn(cr);
+      }
+      return 0;
+    }
+
+    if (this.state.lxstate.mapbreached && this.chipIsAlive()) {
+      this.removeChip(ChipStatus.CHIP_COLLIDED, cr);
+      return -1;
+    }
+
+    if (cr.id !== Tile.Chip) {
+      this.removeClaim(cr.pos);
+      if (cr.id !== Tile.Block && cr.pos === this.state.lxstate.chiptopos) {
+        this.state.lxstate.chiptocr = cr;
+      }
+    } else if (this.state.lxstate.chiptocr && !this.state.lxstate.chiptocr.hidden) {
+      this.state.lxstate.chiptocr.moving = 8;
+      this.removeChip(ChipStatus.CHIP_COLLIDED, this.state.lxstate.chiptocr);
+      return -1;
+    }
+
+    cr.pos += delta[dir] ?? 0;
+    if (cr.id !== Tile.Chip) {
+      this.claimLocation(cr.pos);
+    }
+
+    cr.moving += 8;
+
+    if (cr.id !== Tile.Chip && cr.pos === this.chipPos() && !this.getChip().hidden) {
+      this.removeChip(ChipStatus.CHIP_COLLIDED, cr);
+      return -1;
+    }
+    if (cr.id === Tile.Chip) {
+      this.state.lxstate.couldntmove = 0;
+      const other = this.lookupCreature(cr.pos, false);
+      if (other) {
+        this.removeChip(ChipStatus.CHIP_COLLIDED, other);
+        return -1;
+      }
+    }
+
+    if (cr.state & CS_PUSHED) {
+      this.state.lxstate.pushing = 1;
+      this.addSoundEffect(SND_BLOCK_MOVING);
+    }
+
+    return +1;
+  }
+
+  /* Continue the given creature's move. (lxlogic.c:1273-1294) */
+  private continueMovement(cr: Creature): boolean {
+    if (isanimation(cr.id)) return true;
+
+    if (cr.id === Tile.Chip && this.state.lxstate.stuck) return true;
+
+    let speed = cr.id === Tile.Blob ? 1 : 2;
+    const floor = this.floorAt(cr.pos);
+    if (isslide(floor) && (cr.id !== Tile.Chip || this.getPossession(Tile.Boots_Slide) === 0)) {
+      speed *= 2;
+    } else if (isice(floor) && (cr.id !== Tile.Chip || this.getPossession(Tile.Boots_Ice) === 0)) {
+      speed *= 2;
+    }
+    cr.moving -= speed;
+    cr.frame = (cr.moving / 2) | 0;
+    return cr.moving > 0;
+  }
+
+  /* Complete the movement of the given creature. Most side effects
+   * produced by moving onto a tile occur at this point. False is
+   * returned if the creature is removed by the time the function
+   * returns. If stationary is true, we are in pedantic mode and handling
+   * creatures starting on top of something. (lxlogic.c:1302-1473)
+   */
+  private endMovement(cr: Creature, stationary: boolean): boolean {
+    let survived = true;
+
+    if (isanimation(cr.id)) return true;
+
+    const floor = this.floorAt(cr.pos);
+
+    if (cr.id === Tile.Chip && this.state.lxstate.putwall !== -1) return true;
+
+    if (cr.id === Tile.Chip && this.getPossession(Tile.Boots_Ice) === 0) {
+      this.applyIceWallTurn(cr);
+    }
+    if (cr.id !== Tile.Chip && !stationary) {
+      this.applyIceWallTurn(cr);
+    }
+
+    if (cr.id === Tile.Chip) {
+      switch (floor) {
+        case Tile.Water:
+          if (this.getPossession(Tile.Boots_Water) === 0) {
+            this.removeChip(ChipStatus.CHIP_DROWNED, null);
+            survived = false;
+          }
+          break;
+        case Tile.Fire:
+          if (stationary) break;
+          if (this.getPossession(Tile.Boots_Fire) === 0) {
+            this.removeChip(ChipStatus.CHIP_BURNED, null);
+            survived = false;
+          }
+          break;
+        case Tile.Dirt:
+        case Tile.BlueWall_Fake:
+          this.state.cellAt(cr.pos).top.id = Tile.Empty;
+          this.addSoundEffect(SND_TILE_EMPTIED);
+          break;
+        case Tile.PopupWall:
+          this.state.cellAt(cr.pos).top.id = Tile.Wall;
+          this.addSoundEffect(SND_WALL_CREATED);
+          break;
+        case Tile.Door_Red:
+        case Tile.Door_Blue:
+        case Tile.Door_Yellow:
+        case Tile.Door_Green:
+          if (floor !== Tile.Door_Green) {
+            this.setPossession(floor, this.getPossession(floor) - 1);
+          }
+          this.state.cellAt(cr.pos).top.id = Tile.Empty;
+          this.addSoundEffect(SND_DOOR_OPENED);
+          break;
+        case Tile.Key_Red:
+        case Tile.Key_Blue:
+        case Tile.Key_Yellow:
+        case Tile.Key_Green:
+          if (this.getPossession(floor) === 255) {
+            this.setPossession(floor, -1);
+          }
+        // Intentional fall-through (matches lxlogic.c:1364).
+        case Tile.Boots_Ice:
+        case Tile.Boots_Slide:
+        case Tile.Boots_Fire:
+        case Tile.Boots_Water:
+          this.setPossession(floor, this.getPossession(floor) + 1);
+          this.state.cellAt(cr.pos).top.id = Tile.Empty;
+          this.addSoundEffect(SND_ITEM_COLLECTED);
+          break;
+        case Tile.Burglar:
+          this.setPossession(Tile.Boots_Ice, 0);
+          this.setPossession(Tile.Boots_Slide, 0);
+          this.setPossession(Tile.Boots_Fire, 0);
+          this.setPossession(Tile.Boots_Water, 0);
+          this.addSoundEffect(SND_BOOTS_STOLEN);
+          break;
+        case Tile.ICChip:
+          if (stationary) break;
+          if (this.state.chipsneeded) {
+            --this.state.chipsneeded;
+          }
+          this.state.cellAt(cr.pos).top.id = Tile.Empty;
+          this.addSoundEffect(SND_IC_COLLECTED);
+          break;
+        case Tile.Socket:
+          this.state.cellAt(cr.pos).top.id = Tile.Empty;
+          this.addSoundEffect(SND_SOCKET_OPENED);
+          break;
+        case Tile.Exit:
+          cr.hidden = true;
+          this.state.lxstate.completed = 1;
+          this.addSoundEffect(SND_CHIP_WINS);
+          break;
+        default:
+          break;
+      }
+    } else if (cr.id === Tile.Block) {
+      switch (floor) {
+        case Tile.Water:
+          this.state.cellAt(cr.pos).top.id = Tile.Dirt;
+          this.addSoundEffect(SND_WATER_SPLASH);
+          this.removeCreature(cr, Tile.Water_Splash);
+          survived = false;
+          break;
+        case Tile.Key_Blue:
+          this.state.cellAt(cr.pos).top.id = Tile.Empty;
+          break;
+        default:
+          break;
+      }
+    } else {
+      switch (floor) {
+        case Tile.Water:
+          if (cr.id !== Tile.Glider) {
+            this.addSoundEffect(SND_WATER_SPLASH);
+            this.removeCreature(cr, Tile.Water_Splash);
+            survived = false;
+          }
+          break;
+        case Tile.Key_Blue:
+          this.state.cellAt(cr.pos).top.id = Tile.Empty;
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (!survived) return false;
+
+    switch (floor) {
+      case Tile.Bomb:
+        if (stationary) break;
+        this.state.cellAt(cr.pos).top.id = Tile.Empty;
+        if (cr.id === Tile.Chip) {
+          this.removeChip(ChipStatus.CHIP_BOMBED, null);
+        } else {
+          this.addSoundEffect(SND_BOMB_EXPLODES);
+          this.removeCreature(cr, Tile.Bomb_Explosion);
+        }
+        survived = false;
+        break;
+      case Tile.Beartrap:
+        if (stationary) break;
+        this.addSoundEffect(SND_TRAP_ENTERED);
+        break;
+      case Tile.Button_Blue:
+        if (stationary) break;
+        this.turnTanks();
+        this.addSoundEffect(SND_BUTTON_PUSHED);
+        break;
+      case Tile.Button_Green:
+        if (stationary) break;
+        this.state.lxstate.togglestate ^= Tile.SwitchWall_Open ^ Tile.SwitchWall_Closed;
+        this.addSoundEffect(SND_BUTTON_PUSHED);
+        break;
+      case Tile.Button_Red:
+        if (stationary) break;
+        if (this.activateCloner(this.clonerFromButton(cr.pos))) {
+          this.addSoundEffect(SND_BUTTON_PUSHED);
+        }
+        break;
+      case Tile.Button_Brown:
+        if (stationary) break;
+        this.addSoundEffect(SND_BUTTON_PUSHED);
+        break;
+      case Tile.Socket:
+      // Intentional fall-through (matches lxlogic.c:1465).
+      case Tile.Dirt:
+      case Tile.BlueWall_Fake:
+        this.state.cellAt(cr.pos).top.id = Tile.Empty; // No sound effect
+        break;
+      default:
+        break;
+    }
+
+    return survived;
+  }
+
+  /* Advance the movement of the given creature. If the creature is not
+   * currently moving but should be, movement is initiated. If the
+   * creature completes their movement, any and all appropriate side
+   * effects are applied. If releasing is true, the movement is occurring
+   * out-of-turn, as with movement across an open beartrap or an
+   * activated clone machine. The return value is +1 if the creature
+   * successfully moved (or successfully remained stationary), 0 if the
+   * creature tried to move and failed, or -1 if the creature was killed
+   * and exists no longer. (lxlogic.c:1485-1521)
    */
   private advanceCreature(cr: Creature, releasing: boolean): number {
-    throw new Error("LynxLogic.advanceCreature: not yet implemented");
+    let tdir = NIL;
+
+    if (cr.moving <= 0 && !isanimation(cr.id)) {
+      if (releasing) {
+        tdir = cr.tdir;
+        cr.tdir = cr.dir;
+      } else if (cr.tdir === NIL && this.getFDir(cr) === NIL) {
+        if (pedanticMode && !this.endMovement(cr, true)) {
+          return -1;
+        }
+        return +1;
+      }
+
+      const f = this.startMovement(cr, releasing);
+      if (f > 0) {
+        cr.hidden = false;
+      }
+      if (pedanticMode && f === 0 && !this.endMovement(cr, true)) {
+        return -1;
+      }
+      if (f < 0) {
+        return f;
+      }
+      if (f === 0) {
+        if (releasing) {
+          cr.tdir = tdir;
+        }
+        return 0;
+      }
+      cr.tdir = NIL;
+    }
+
+    if (!this.continueMovement(cr)) {
+      if (!this.endMovement(cr, false)) {
+        return -1;
+      }
+    }
+
+    return +1;
   }
 
   /*
