@@ -8,8 +8,9 @@ import { expandLevelData } from "./decoder";
 import { LynxLogic } from "./logic/lynx";
 import { MsLogic } from "./logic/ms";
 import type { RulesetLogic } from "./logic/ruleset";
+import type { SolutionInfo } from "./solution";
 import { GameState } from "./state";
-import type { Action, Creature, GameSetup } from "./types";
+import type { Creature, GameSetup } from "./types";
 
 // play.c does not define a numeric CmdPreserve constant anywhere the TS port
 // has ported so far (it's just an ordinary auto-incremented enum member in
@@ -18,17 +19,6 @@ import type { Action, Creature, GameSetup } from "./types";
 // since all real commands are >= 0 (NIL=0, directions are small positive bit
 // flags, mouse commands are computed from a 0-based range).
 export const CmdPreserve = -1;
-
-// Placeholder shape for a decoded solution, standing in for the real
-// `SolutionInfo` interface that Task 13's .tws-format decoder will define.
-// `prepareReplay` only needs these four fields; align this with the real
-// type once Task 13 lands.
-export interface ReplaySolution {
-  moves: Action[];
-  rndseed: number;
-  rndslidedir: number;
-  stepping: number;
-}
 
 // A reasonable, deterministic-but-arbitrary default seed for fresh
 // (non-replay) games. The original C `resetprng()` seeds from the wall
@@ -113,7 +103,7 @@ export class Game {
   }
 
   // play.c:141-158 — prepareplayback
-  prepareReplay(sol: ReplaySolution): void {
+  prepareReplay(sol: SolutionInfo): void {
     const state = this.gameState;
     state.moves = sol.moves;
     state.mainprng.restart(sol.rndseed);
