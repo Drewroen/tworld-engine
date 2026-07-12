@@ -77,7 +77,9 @@ export class Game {
     }
 
     this.gameState = state;
-    this.logic.initGame();
+    if (!this.logic.initGame()) {
+      throw new Error("Game: initGame failed; invalid level data.");
+    }
   }
 
   // play.c:292-333 — doturn
