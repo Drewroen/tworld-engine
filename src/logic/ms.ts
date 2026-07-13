@@ -2199,7 +2199,7 @@ export class MsLogic implements RulesetLogic {
         creatureid(cell.top.id) === Tile.Chip
       ) {
         chip.pos = pos;
-        chip.dir = creaturedirid(cell.bot.id);
+        chip.dir = creaturedirid(cell.top.id);
       }
     }
 
