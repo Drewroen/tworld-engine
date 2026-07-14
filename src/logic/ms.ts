@@ -2129,6 +2129,23 @@ export class MsLogic implements RulesetLogic {
       Math.floor(pos / CYGRID) * 8 + this.state.msstate.yviewoffset * 8;
   }
 
+  /* Exposes the live creature list for host rendering (mirrors
+   * LynxLogic.activeCreatures()). this.state.creatures already IS
+   * exactly the flat list of currently-active creatures under MS (see
+   * the architecture note above), so this is a direct passthrough — no
+   * filtering needed, unlike Lynx's crEndIndex-bounded slice. Not used
+   * by the C-oracle differential tests (see test/ms.diff.test.ts's
+   * comment): the original mslogic.c's creature list is a private
+   * module-static the oracle harness itself can't reach, so there is no
+   * golden digest to diff creature positions against for MS. That is a
+   * test-fixture limitation, not a reason to withhold this data from a
+   * real host, which is why test/game.smoke.test.ts (not a diff test)
+   * verifies this method instead.
+   */
+  activeCreatures(): Creature[] {
+    return [...this.state.creatures];
+  }
+
   /* Initialize the gamestate structure to the state at the beginning of
    * the level. (mslogic.c:2252-2338)
    */

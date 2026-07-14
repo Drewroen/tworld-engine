@@ -16,3 +16,20 @@ describe("Game (Lynx smoke)", () => {
     expect(r).toBe(0);
   });
 });
+
+describe("Game (MS creature list)", () => {
+  it("exposes non-Chip creatures via getCreatures(), not just Chip", () => {
+    const { levels } = splitDatFile(dat);
+    let sawNonChipCreature = false;
+    for (const level of levels) {
+      const g = new Game(level, Ruleset.MS);
+      const creatures = g.getCreatures();
+      expect(creatures.length).toBeGreaterThan(0);
+      expect(creatures[0]!.id).toBe(g.state.creatures[0]!.id);
+      if (creatures.some((c) => c !== creatures[0] && !c.hidden)) {
+        sawNonChipCreature = true;
+      }
+    }
+    expect(sawNonChipCreature).toBe(true);
+  });
+});

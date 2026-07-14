@@ -6,10 +6,10 @@
 // Mirrors test/lynx.diff.test.ts exactly (see that file for the fixture
 // file-format note). One MS-specific wrinkle: mslogic.c's creature list is
 // a private, unexported module-static with no accessor, so the oracle
-// harness always emits "creatures":[] for MS digests; MsLogic likewise
-// doesn't implement the optional activeCreatures() method, so
-// Game.getCreatures() falls back to [] on the TS side too (see
-// src/game.ts's getCreatures doc comment). This is a genuine,
+// harness always emits "creatures":[] for MS digests; MsLogic's
+// activeCreatures() (added for host rendering — see src/logic/ms.ts) has
+// no golden creature-position data to verify against here either way.
+// This is a genuine,
 // already-analyzed architectural limitation of the original C mslogic.c,
 // not a gap for this port to paper over — the fidelity signal here comes
 // from chipsNeeded/keys/boots/xview/yview/statusflags/soundeffects/
@@ -41,10 +41,17 @@ describe.each(fixtureNames)("MS differential: %s", (name) => {
 
     // Compare tick-by-tick (rather than one blanket array-level toEqual) so
     // a mismatch's vitest failure output pinpoints the exact divergent tick
-    // and field instead of dumping the whole array diff.
+    // and field instead of dumping the whole array diff. `creatures` is
+    // excluded from the comparison: the golden fixtures hardcode it to []
+    // (the C oracle can't reach mslogic.c's module-static creature list —
+    // see the file comment above), while the TS side now reports real data
+    // via MsLogic.activeCreatures(), so the two are expected to diverge on
+    // this field specifically.
     expect(got.length).toBe(golden.length);
     for (let i = 0; i < golden.length; i++) {
-      expect(got[i], `tick ${i}`).toEqual(golden[i]);
+      const { creatures: _gotCreatures, ...gotRest } = got[i]!;
+      const { creatures: _goldenCreatures, ...goldenRest } = golden[i]!;
+      expect(gotRest, `tick ${i}`).toEqual(goldenRest);
     }
   });
 });
