@@ -2,10 +2,10 @@
 
 A TypeScript port of the [Tile World](https://github.com/eyecreate/tworld) Chip's
 Challenge game logic — the Lynx and MS ruleset simulations, level decoding, and
-solution (`.tws`) replay decoding. The port is verified bit-exact against a
-compiled C oracle built from the original Tile World source, via per-tick
-differential tests covering ice, force floors, blocks, monsters, teleports,
-traps, and clone machines in both rulesets.
+solution (`.tws`) replay decoding. The port is verified by replaying ~1,500 real
+recorded playthroughs — the public solution sets for CHIPS and CCLP1-4 from
+[SuperCC](https://github.com/SicklySilverMoon/SuperCC) — every one of which wins
+under both the Lynx and MS rulesets.
 
 This package is a headless simulation engine only. It has no renderer, no
 audio, and no wall clock: it owns its own tick counter and produces the same

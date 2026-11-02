@@ -129,8 +129,7 @@ export class Game {
   }
 
   // Exposes the ruleset's live creature list, if it has one (Lynx does; see
-  // LynxLogic.activeCreatures). Returns [] for rulesets that don't expose
-  // one, matching the oracle harness's own MS-ruleset behavior.
+  // LynxLogic.activeCreatures). Returns [] for rulesets that don't expose one.
   getCreatures(): Creature[] {
     return this.logic.activeCreatures ? this.logic.activeCreatures() : [];
   }

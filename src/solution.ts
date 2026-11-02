@@ -132,8 +132,22 @@ export function decodeSolution(bytes: Uint8Array): SolutionInfo {
           // Format #2: 4 bytes, 2-bit orthogonal direction, 27-bit delta.
           if (p + 4 > bytes.length) throw new Error("decodeSolution: truncated solution data");
           const dir = idxdir8[(b0 >> 2) & 0x03]!;
+          // The delta is 27 bits wide (3 in byte0, 8 each in bytes 1-2, 8 in
+          // byte3), but solution.c's own format description (solution.c:71-74)
+          // notes the top four bits "will always be zero" because the game
+          // timer is limited to 23 bits. Tile World's writer (storesolution,
+          // solution.c:466) therefore only ever emits 0 in byte3's high
+          // nibble, and its reader (expandsolution, solution.c:357) reads the
+          // whole byte. SuperCC's writer, however, stamps the high nibble with
+          // 0x9 as a marker, so solution files produced by it (e.g. the public
+          // CCLP sets) carry 0x90|value in byte3. Masking the high nibble here
+          // is spec-compliant (it is documented as always-zero) and, unlike the
+          // literal C read, lets such files decode correctly.
           const delta =
-            ((b0 >> 5) & 0x07) | (bytes[p + 1]! << 3) | (bytes[p + 2]! << 11) | (bytes[p + 3]! << 19);
+            ((b0 >> 5) & 0x07) |
+            (bytes[p + 1]! << 3) |
+            (bytes[p + 2]! << 11) |
+            ((bytes[p + 3]! & 0x0f) << 19);
           when += delta + 1;
           moves.push({ when, dir });
           p += 4;

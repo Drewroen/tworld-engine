@@ -67,6 +67,22 @@ describe("decodeSolution", () => {
     expect(sol.moves).toEqual([{ when: 100000, dir: 2 }]);
   });
 
+  it("ignores the high nibble of format #2's top time byte", () => {
+    // The 27-bit format #2 delta spans byte3's full 8 bits in the C source
+    // (solution.c:357), but solution.c's own format description says the top
+    // four bits are "always zero" because the timer is limited to 23 bits.
+    // Tile World's writer honors that; SuperCC's .tws writer instead stamps
+    // byte3's high nibble with 0x9, so files it produces carry 0x90 | value.
+    // A tolerant decoder masks the always-zero high nibble, which recovers the
+    // delta exactly as if the marker were absent.
+    //
+    // Same move as the format #2 case above (dir=WEST, T=100000) but with
+    // byte3 = 0x90 instead of 0x00. Expected: identical decode.
+    const bytes = record({}, [0x07, 0xd4, 0x30, 0x90]);
+    const sol = decodeSolution(bytes);
+    expect(sol.moves).toEqual([{ when: 100000, dir: 2 }]);
+  });
+
   it("decodes format #3 (1-byte, three packed moves, implicit delta of 4)", () => {
     // byte = F<<6 | E<<4 | D<<2 | 00, with D=3 (EAST), E=0 (NORTH), F=1 (WEST).
     // byte = (1<<6) | (0<<4) | (3<<2) | 0 = 64 + 12 = 76 = 0x4C.

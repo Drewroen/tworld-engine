@@ -23,8 +23,8 @@ export interface RulesetLogic {
    * The live, active creature list (Chip included), if this ruleset exposes
    * one. Lynx keeps its list directly on GameState (see lxlogic.c's
    * creaturelist() macro) so this is cheap; MS keeps its list in a private
-   * module-static array with no accessor (see tools/oracle/harness.c's
-   * digest notes), so an MS implementation may omit this method.
+   * module-static array with no accessor, so an MS implementation may omit
+   * this method.
    */
   activeCreatures?(): Creature[];
 }

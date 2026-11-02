@@ -2133,14 +2133,7 @@ export class MsLogic implements RulesetLogic {
    * LynxLogic.activeCreatures()). this.state.creatures already IS
    * exactly the flat list of currently-active creatures under MS (see
    * the architecture note above), so this is a direct passthrough — no
-   * filtering needed, unlike Lynx's crEndIndex-bounded slice. Not used
-   * by the C-oracle differential tests (see test/ms.diff.test.ts's
-   * comment): the original mslogic.c's creature list is a private
-   * module-static the oracle harness itself can't reach, so there is no
-   * golden digest to diff creature positions against for MS. That is a
-   * test-fixture limitation, not a reason to withhold this data from a
-   * real host, which is why test/game.smoke.test.ts (not a diff test)
-   * verifies this method instead.
+   * filtering needed, unlike Lynx's crEndIndex-bounded slice.
    */
   activeCreatures(): Creature[] {
     return [...this.state.creatures];
