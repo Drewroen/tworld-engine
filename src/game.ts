@@ -8,9 +8,15 @@ import { expandLevelData } from "./decoder";
 import { LynxLogic } from "./logic/lynx";
 import { MsLogic } from "./logic/ms";
 import type { RulesetLogic } from "./logic/ruleset";
+import { HookRegistry, type GameHookContext, type Mod } from "./mod";
 import type { SolutionInfo } from "./solution";
 import { GameState } from "./state";
 import type { Creature, GameSetup } from "./types";
+
+export interface GameOptions {
+  /** Mods to equip for this game. Omitted/empty means vanilla behavior. */
+  mods?: readonly Mod[];
+}
 
 // play.c does not define a numeric CmdPreserve constant anywhere the TS port
 // has ported so far (it's just an ordinary auto-incremented enum member in
@@ -34,8 +40,14 @@ const DEFAULT_FRESH_SEED = 0;
 export class Game {
   private readonly logic: RulesetLogic;
   private readonly gameState: GameState;
+  private readonly hooks: HookRegistry;
 
-  constructor(game: GameSetup, ruleset: number, seed = DEFAULT_FRESH_SEED) {
+  constructor(
+    game: GameSetup,
+    ruleset: number,
+    seed = DEFAULT_FRESH_SEED,
+    options: GameOptions = {},
+  ) {
     const state = new GameState();
     // A freshly constructed GameState already has a zeroed map (see
     // state.ts), so no explicit re-zeroing is needed here — unlike the C
@@ -59,18 +71,33 @@ export class Game {
       throw new Error("Game: expandLevelData failed; invalid level data.");
     }
 
+    this.gameState = state;
+    this.hooks = new HookRegistry(options.mods ?? [], ruleset, state);
+
     if (ruleset === Ruleset.Lynx) {
-      this.logic = new LynxLogic(state);
+      this.logic = new LynxLogic(state, this.hooks);
     } else if (ruleset === Ruleset.MS) {
-      this.logic = new MsLogic(state);
+      this.logic = new MsLogic(state, this.hooks);
     } else {
       throw new Error(`Game: unknown ruleset ${ruleset}.`);
     }
 
-    this.gameState = state;
     if (!this.logic.initGame()) {
       throw new Error("Game: initGame failed; invalid level data.");
     }
+
+    if (this.hooks.has("game.init")) {
+      this.hooks.run("game.init", this.makeHookContext(), () => undefined);
+    }
+  }
+
+  private makeHookContext(): GameHookContext {
+    return {
+      state: this.gameState,
+      ruleset: this.gameState.ruleset,
+      api: this.hooks.api,
+      time: this.gameState.currenttime,
+    };
   }
 
   // play.c:292-333 — doturn
@@ -92,11 +119,21 @@ export class Game {
       }
     }
 
+    if (this.hooks.has("game.beforeTick")) {
+      this.hooks.run("game.beforeTick", this.makeHookContext(), () => undefined);
+    }
+
     const result = this.logic.advanceGame();
 
     if (state.replay < 0 && state.lastmove) {
       state.moves.push({ when: state.currenttime, dir: state.lastmove });
       state.lastmove = NIL;
+    }
+
+    if (this.hooks.has("game.afterTick")) {
+      const ctx = this.makeHookContext();
+      ctx.result = result;
+      return this.hooks.run("game.afterTick", ctx, () => result);
     }
 
     return result;

@@ -7,7 +7,28 @@
 // exposes the state a host needs to draw a frame and play sounds
 // (creature positions, keys/boots, xviewpos/yviewpos, soundeffects bits).
 
-export { Game } from "./game";
+export { Game, type GameOptions } from "./game";
+export {
+  MOD_API_VERSION,
+  defineMod,
+  HookRegistry,
+  createModApi,
+  type BaseHookContext,
+  type GameHookContext,
+  type HazardEnterContext,
+  type HookDefinition,
+  type HookHandler,
+  type HookName,
+  type HookSelector,
+  type ItemCollectContext,
+  type Mod,
+  type ModApi,
+  type ModHooks,
+  type MoveCanMakeContext,
+  type MoveEndContext,
+  type OneOrMany,
+  type RulesetName,
+} from "./mod";
 export { splitDatFile } from "./datfile";
 export { expandLevelData } from "./decoder";
 export { decodeSolution } from "./solution";

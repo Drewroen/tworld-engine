@@ -47,6 +47,19 @@ game.state.soundeffects;  // bitmask of sound effects to play this tick
 `Game` also exposes `secondsPlayed()`, `getSoundEffects()`, and
 `getCreatures()` as convenience accessors over the same state.
 
+## Modding
+
+Mods are ordinary ES modules passed to the `Game` constructor. They can wrap
+or replace engine behavior at named extension points, such as item collection,
+hazard entry, movement decisions, and tick lifecycle:
+
+```ts
+const game = new Game(levels[0], Ruleset.MS, 0, { mods: [myMod] });
+```
+
+See [MODDING.md](./MODDING.md) for the hook API, selectors, persistent mod
+state, and determinism rules.
+
 ## Replaying a solution
 
 To deterministically replay a recorded `.tws` solution instead of driving the

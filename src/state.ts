@@ -86,6 +86,13 @@ export class GameState {
   hinttext = "";
   map: MapCell[] = Array.from({ length: CXGRID * CYGRID }, makeMapCell);
 
+  // Mod-facing state. `counters` holds named integer counters (custom keys,
+  // boots, collectibles, etc.); `mod` is arbitrary persistent per-game state
+  // owned by mods. Both are plain data so they can be serialized/deep-cloned
+  // by hosts that save games.
+  counters: Record<string, number> = {};
+  mod: Record<string, unknown> = {};
+
   msstate = new MSState();
   lxstate = new LXState();
 

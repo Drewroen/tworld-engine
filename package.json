@@ -9,7 +9,7 @@
   "exports": {
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.cjs" }
   },
-  "files": ["dist"],
+  "files": ["dist", "MODDING.md"],
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
     "prepare": "npm run build",

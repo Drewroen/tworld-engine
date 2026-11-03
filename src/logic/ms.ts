@@ -128,6 +128,13 @@ import {
   right,
   Tile,
 } from "../constants";
+import type {
+  HazardEnterContext,
+  HookRegistry,
+  ItemCollectContext,
+  MoveCanMakeContext,
+  MoveEndContext,
+} from "../mod";
 import { GameState, SF_BADTILES, SF_NOANIMATION, SF_SHOWHINT } from "../state";
 import type { Creature, MapTile } from "../types";
 import type { RulesetLogic } from "./ruleset";
@@ -305,10 +312,14 @@ const CMM_TELEPORTPUSH = 0x0010;
 const CMM_NOFIRECHECK = 0x0020;
 const CMM_NODEFERBUTTONS = 0x0040;
 
+/* Position delta indexed by direction (NIL, NORTH, WEST, SOUTH, EAST). */
+const MS_DELTA = [0, -CXGRID, -1, 0, +CXGRID, 0, 0, 0, +1];
+
 export class MsLogic implements RulesetLogic {
   readonly ruleset = Ruleset.MS;
 
   private state: GameState;
+  private readonly hooks: HookRegistry;
 
   /* The most recently used stepping phase value. (mslogic.c:36 — instance
    * field here; see design note above.)
@@ -332,8 +343,24 @@ export class MsLogic implements RulesetLogic {
    */
   private slipperCount = 0;
 
-  constructor(state: GameState) {
+  constructor(state: GameState, hooks: HookRegistry) {
     this.state = state;
+    this.hooks = hooks;
+  }
+
+  private hookContext() {
+    return {
+      state: this.state,
+      ruleset: this.ruleset,
+      api: this.hooks.api,
+      time: this.state.currenttime,
+    } as const;
+  }
+
+  private actorKind(cr: Creature): "chip" | "block" | "creature" {
+    if (cr.id === Tile.Chip) return "chip";
+    if (cr.id === Tile.Block) return "block";
+    return "creature";
   }
 
   /*
@@ -987,6 +1014,44 @@ export class MsLogic implements RulesetLogic {
     this.state.msstate.goalpos = -1;
   }
 
+  /* Hookable wrapper around canMakeMove(). A mod can veto the move or
+   * replace the default decision entirely by returning without calling
+   * next(). The default implementation below is the vanilla MS logic.
+   */
+  private canMakeMove(cr: Creature, dir: number, flags: number): boolean {
+    if (!this.hooks.has("move.canMake")) {
+      return this.defaultCanMakeMove(cr, dir, flags);
+    }
+
+    let y = Math.floor(cr.pos / CXGRID);
+    let x = cr.pos % CXGRID;
+    y += dir === NORTH ? -1 : dir === SOUTH ? 1 : 0;
+    x += dir === WEST ? -1 : dir === EAST ? 1 : 0;
+    const inBounds = y >= 0 && y < CYGRID && x >= 0 && x < CXGRID;
+    const to = inBounds ? y * CXGRID + x : -1;
+    const floor = !inBounds
+      ? Tile.Nothing
+      : cr.id === Tile.Chip
+        ? this.floorAt(to)
+        : this.state.cellAt(to).top.id;
+
+    const ctx: MoveCanMakeContext = {
+      ...this.hookContext(),
+      creature: cr,
+      who: this.actorKind(cr),
+      dir,
+      flags,
+      from: cr.pos,
+      to,
+      floor,
+      tileId: floor,
+    };
+
+    return this.hooks.run("move.canMake", ctx, () =>
+      this.defaultCanMakeMove(cr, dir, flags),
+    );
+  }
+
   /* The central function determining whether a creature is permitted to
    * move in a given direction. See the design notes accompanying this
    * dispatch for a summary of the several documented historical quirks
@@ -994,7 +1059,7 @@ export class MsLogic implements RulesetLogic {
    * BlueWall_Real pattern, the two "totally backwards" block-pushing
    * checks, and the turning-tank cloning patch). (mslogic.c:992-1107)
    */
-  private canMakeMove(cr: Creature, dir: number, flags: number): boolean {
+  private defaultCanMakeMove(cr: Creature, dir: number, flags: number): boolean {
     let y = Math.floor(cr.pos / CXGRID);
     let x = cr.pos % CXGRID;
     y += dir === NORTH ? -1 : dir === SOUTH ? 1 : 0;
@@ -1614,8 +1679,93 @@ export class MsLogic implements RulesetLogic {
    * source and is omitted here rather than reproduced as a TS comment.
    * (mslogic.c:1596-1866)
    */
-  private endMovement(cr: Creature, dir: number): void {
-    const delta = [0, -CXGRID, -1, 0, +CXGRID, 0, 0, 0, +1];
+  private endMovement(cr: Creature, dir: number): boolean {
+    const oldPos = cr.pos;
+    const newPos = oldPos + MS_DELTA[dir]!;
+    const floor =
+      newPos >= 0 && newPos < CXGRID * CYGRID
+        ? this.state.cellAt(newPos).top.id
+        : Tile.Nothing;
+
+    if (!this.hooks.has("move.end")) {
+      this.defaultEndMovement(cr, dir);
+      return this.isCreatureAlive(cr);
+    }
+
+    const ctx: MoveEndContext = {
+      ...this.hookContext(),
+      creature: cr,
+      who: this.actorKind(cr),
+      dir,
+      pos: newPos,
+      tileId: floor,
+      survived: true,
+    };
+
+    return this.hooks.run("move.end", ctx, () => {
+      this.defaultEndMovement(cr, dir);
+      ctx.survived = this.isCreatureAlive(cr);
+      return ctx.survived;
+    });
+  }
+
+  private isCreatureAlive(cr: Creature): boolean {
+    if (cr.id === Tile.Chip) {
+      const status = this.state.msstate.chipstatus;
+      return (
+        status === ChipStatus.CHIP_OKAY || status === ChipStatus.CHIP_SQUISHED
+      );
+    }
+    return !cr.hidden;
+  }
+
+  private runItemCollect(
+    cr: Creature,
+    pos: number,
+    item: number,
+    tile: MapTile,
+    defaultHandler: () => void,
+  ): void {
+    if (!this.hooks.has("item.collect")) {
+      defaultHandler();
+      return;
+    }
+
+    const ctx: ItemCollectContext = {
+      ...this.hookContext(),
+      creature: cr,
+      who: "chip",
+      pos,
+      item,
+      tile,
+      tileId: item,
+    };
+    this.hooks.run("item.collect", ctx, defaultHandler);
+  }
+
+  private runHazard(
+    cr: Creature,
+    pos: number,
+    hazard: number,
+    tile: MapTile,
+    defaultHandler: () => boolean,
+  ): boolean {
+    if (!this.hooks.has("hazard.enter")) return defaultHandler();
+
+    const ctx: HazardEnterContext = {
+      ...this.hookContext(),
+      creature: cr,
+      who: this.actorKind(cr),
+      pos,
+      hazard,
+      tile,
+      tileId: hazard,
+    };
+    return this.hooks.run("hazard.enter", ctx, defaultHandler);
+  }
+
+  private defaultEndMovement(cr: Creature, dir: number): void {
+    const delta = MS_DELTA;
     let dead = false;
 
     const oldPos = cr.pos;
@@ -1632,14 +1782,26 @@ export class MsLogic implements RulesetLogic {
         case Tile.Empty:
           this.popTile(newPos);
           break;
-        case Tile.Water:
-          if (!this.getPossession(Tile.Boots_Water))
-            this.state.msstate.chipstatus = ChipStatus.CHIP_DROWNED;
+        case Tile.Water: {
+          this.runHazard(cr, newPos, floor, tile, () => {
+            if (!this.getPossession(Tile.Boots_Water)) {
+              this.state.msstate.chipstatus = ChipStatus.CHIP_DROWNED;
+              return false;
+            }
+            return true;
+          });
           break;
-        case Tile.Fire:
-          if (!this.getPossession(Tile.Boots_Fire))
-            this.state.msstate.chipstatus = ChipStatus.CHIP_BURNED;
+        }
+        case Tile.Fire: {
+          this.runHazard(cr, newPos, floor, tile, () => {
+            if (!this.getPossession(Tile.Boots_Fire)) {
+              this.state.msstate.chipstatus = ChipStatus.CHIP_BURNED;
+              return false;
+            }
+            return true;
+          });
           break;
+        }
         case Tile.Dirt:
           this.popTile(newPos);
           break;
@@ -1666,10 +1828,13 @@ export class MsLogic implements RulesetLogic {
         case Tile.Key_Blue:
         case Tile.Key_Yellow:
         case Tile.Key_Green:
-          if (iscreature(cell.bot.id)) this.state.msstate.chipstatus = ChipStatus.CHIP_COLLIDED;
-          this.setPossession(floor, this.getPossession(floor) + 1);
-          this.popTile(newPos);
-          this.addSoundEffect(SND_ITEM_COLLECTED);
+          this.runItemCollect(cr, newPos, floor, tile, () => {
+            if (iscreature(cell.bot.id))
+              this.state.msstate.chipstatus = ChipStatus.CHIP_COLLIDED;
+            this.setPossession(floor, this.getPossession(floor) + 1);
+            this.popTile(newPos);
+            this.addSoundEffect(SND_ITEM_COLLECTED);
+          });
           break;
         case Tile.Burglar:
           this.state.boots[0] = 0;
@@ -1679,18 +1844,24 @@ export class MsLogic implements RulesetLogic {
           this.addSoundEffect(SND_BOOTS_STOLEN);
           break;
         case Tile.ICChip:
-          if (this.state.chipsneeded) --this.state.chipsneeded;
-          this.popTile(newPos);
-          this.addSoundEffect(SND_IC_COLLECTED);
+          this.runItemCollect(cr, newPos, floor, tile, () => {
+            if (this.state.chipsneeded) --this.state.chipsneeded;
+            this.popTile(newPos);
+            this.addSoundEffect(SND_IC_COLLECTED);
+          });
           break;
         case Tile.Socket:
           this.popTile(newPos);
           this.addSoundEffect(SND_SOCKET_OPENED);
           break;
-        case Tile.Bomb:
-          this.state.msstate.chipstatus = ChipStatus.CHIP_BOMBED;
-          this.addSoundEffect(SND_BOMB_EXPLODES);
+        case Tile.Bomb: {
+          this.runHazard(cr, newPos, floor, tile, () => {
+            this.state.msstate.chipstatus = ChipStatus.CHIP_BOMBED;
+            this.addSoundEffect(SND_BOMB_EXPLODES);
+            return false;
+          });
           break;
+        }
         default:
           if (iscreature(floor)) this.state.msstate.chipstatus = ChipStatus.CHIP_COLLIDED;
           break;

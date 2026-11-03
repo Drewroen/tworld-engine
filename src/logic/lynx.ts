@@ -70,6 +70,7 @@ import {
   isslide,
   isdoor,
   isfloor,
+  iskey,
   iscreature,
   ismsspecial,
   crtile,
@@ -100,8 +101,15 @@ import {
   SND_TRAP_ENTERED,
   SND_BUTTON_PUSHED,
 } from "../constants";
+import type {
+  HazardEnterContext,
+  HookRegistry,
+  ItemCollectContext,
+  MoveCanMakeContext,
+  MoveEndContext,
+} from "../mod";
 import { GameState, SF_BADTILES, SF_INVALID, SF_SHOWHINT } from "../state";
-import type { Creature } from "../types";
+import type { Creature, MapTile } from "../types";
 import type { RulesetLogic } from "./ruleset";
 
 /* A number well above the maximum number of creatures that could possibly
@@ -316,6 +324,7 @@ export class LynxLogic implements RulesetLogic {
   readonly ruleset = Ruleset.Lynx;
 
   private state: GameState;
+  private readonly hooks: HookRegistry;
 
   /* The direction used the last time something stepped onto a random
    * slide floor. (lxlogic.c:68 — instance field here; see design note above.)
@@ -334,8 +343,24 @@ export class LynxLogic implements RulesetLogic {
    */
   private crEndIndex = 0;
 
-  constructor(state: GameState) {
+  constructor(state: GameState, hooks: HookRegistry) {
     this.state = state;
+    this.hooks = hooks;
+  }
+
+  private hookContext() {
+    return {
+      state: this.state,
+      ruleset: this.ruleset,
+      api: this.hooks.api,
+      time: this.state.currenttime,
+    } as const;
+  }
+
+  private actorKind(cr: Creature): "chip" | "block" | "creature" {
+    if (cr.id === Tile.Chip) return "chip";
+    if (cr.id === Tile.Block) return "block";
+    return "creature";
   }
 
   /* Returns the live, active portion of the creature list (indices
@@ -843,11 +868,44 @@ export class LynxLogic implements RulesetLogic {
     return true;
   }
 
+  /* Hookable wrapper around canMakeMove(). Returning without calling next()
+   * replaces the vanilla movement decision. (lxlogic.c:724-818)
+   */
+  private canMakeMove(cr: Creature, dir: number, flags: number): boolean {
+    if (!this.hooks.has("move.canMake")) {
+      return this.defaultCanMakeMove(cr, dir, flags);
+    }
+
+    let y = Math.floor(cr.pos / CXGRID);
+    let x = cr.pos % CXGRID;
+    y += dir === NORTH ? -1 : dir === SOUTH ? 1 : 0;
+    x += dir === WEST ? -1 : dir === EAST ? 1 : 0;
+    const inBounds = y >= 0 && y < CYGRID && x >= 0 && x < CXGRID;
+    const to = inBounds ? y * CXGRID + x : -1;
+    const floor = inBounds ? this.floorAt(to) : Tile.Nothing;
+
+    const ctx: MoveCanMakeContext = {
+      ...this.hookContext(),
+      creature: cr,
+      who: this.actorKind(cr),
+      dir,
+      flags,
+      from: cr.pos,
+      to,
+      floor,
+      tileId: floor,
+    };
+
+    return this.hooks.run("move.canMake", ctx, () =>
+      this.defaultCanMakeMove(cr, dir, flags),
+    );
+  }
+
   /* Return TRUE if the given creature is allowed to attempt to move in
    * the given direction. Side effects can and will occur from calling
    * this function, as indicated by flags. (lxlogic.c:724-818)
    */
-  private canMakeMove(cr: Creature, dir: number, flags: number): boolean {
+  private defaultCanMakeMove(cr: Creature, dir: number, flags: number): boolean {
     let floor = this.floorAt(cr.pos);
     switch (floor) {
       case Tile.Wall_North:
@@ -1405,6 +1463,73 @@ export class LynxLogic implements RulesetLogic {
    * creatures starting on top of something. (lxlogic.c:1302-1473)
    */
   private endMovement(cr: Creature, stationary: boolean): boolean {
+    if (!this.hooks.has("move.end")) {
+      return this.defaultEndMovement(cr, stationary);
+    }
+
+    const ctx: MoveEndContext = {
+      ...this.hookContext(),
+      creature: cr,
+      who: this.actorKind(cr),
+      dir: cr.dir,
+      pos: cr.pos,
+      tileId: this.floorAt(cr.pos),
+      survived: true,
+    };
+
+    return this.hooks.run("move.end", ctx, () => {
+      const survived = this.defaultEndMovement(cr, stationary);
+      ctx.survived = survived;
+      return survived;
+    });
+  }
+
+  private runItemCollect(
+    cr: Creature,
+    pos: number,
+    item: number,
+    tile: MapTile,
+    defaultHandler: () => void,
+  ): void {
+    if (!this.hooks.has("item.collect")) {
+      defaultHandler();
+      return;
+    }
+
+    const ctx: ItemCollectContext = {
+      ...this.hookContext(),
+      creature: cr,
+      who: "chip",
+      pos,
+      item,
+      tile,
+      tileId: item,
+    };
+    this.hooks.run("item.collect", ctx, defaultHandler);
+  }
+
+  private runHazard(
+    cr: Creature,
+    pos: number,
+    hazard: number,
+    tile: MapTile,
+    defaultHandler: () => boolean,
+  ): boolean {
+    if (!this.hooks.has("hazard.enter")) return defaultHandler();
+
+    const ctx: HazardEnterContext = {
+      ...this.hookContext(),
+      creature: cr,
+      who: this.actorKind(cr),
+      pos,
+      hazard,
+      tile,
+      tileId: hazard,
+    };
+    return this.hooks.run("hazard.enter", ctx, defaultHandler);
+  }
+
+  private defaultEndMovement(cr: Creature, stationary: boolean): boolean {
     let survived = true;
 
     if (isanimation(cr.id)) return true;
@@ -1422,19 +1547,41 @@ export class LynxLogic implements RulesetLogic {
 
     if (cr.id === Tile.Chip) {
       switch (floor) {
-        case Tile.Water:
-          if (this.getPossession(Tile.Boots_Water) === 0) {
-            this.removeChip(ChipStatus.CHIP_DROWNED, null);
-            survived = false;
-          }
+        case Tile.Water: {
+          const survivedHazard = this.runHazard(
+            cr,
+            cr.pos,
+            floor,
+            this.state.cellAt(cr.pos).top,
+            () => {
+              if (this.getPossession(Tile.Boots_Water) === 0) {
+                this.removeChip(ChipStatus.CHIP_DROWNED, null);
+                return false;
+              }
+              return true;
+            },
+          );
+          if (!survivedHazard) survived = false;
           break;
-        case Tile.Fire:
+        }
+        case Tile.Fire: {
           if (stationary) break;
-          if (this.getPossession(Tile.Boots_Fire) === 0) {
-            this.removeChip(ChipStatus.CHIP_BURNED, null);
-            survived = false;
-          }
+          const survivedHazard = this.runHazard(
+            cr,
+            cr.pos,
+            floor,
+            this.state.cellAt(cr.pos).top,
+            () => {
+              if (this.getPossession(Tile.Boots_Fire) === 0) {
+                this.removeChip(ChipStatus.CHIP_BURNED, null);
+                return false;
+              }
+              return true;
+            },
+          );
+          if (!survivedHazard) survived = false;
           break;
+        }
         case Tile.Dirt:
         case Tile.BlueWall_Fake:
           this.state.cellAt(cr.pos).top.id = Tile.Empty;
@@ -1458,17 +1605,24 @@ export class LynxLogic implements RulesetLogic {
         case Tile.Key_Blue:
         case Tile.Key_Yellow:
         case Tile.Key_Green:
-          if (this.getPossession(floor) === 255) {
-            this.setPossession(floor, -1);
-          }
-        // Intentional fall-through (matches lxlogic.c:1364).
         case Tile.Boots_Ice:
         case Tile.Boots_Slide:
         case Tile.Boots_Fire:
         case Tile.Boots_Water:
-          this.setPossession(floor, this.getPossession(floor) + 1);
-          this.state.cellAt(cr.pos).top.id = Tile.Empty;
-          this.addSoundEffect(SND_ITEM_COLLECTED);
+          this.runItemCollect(
+            cr,
+            cr.pos,
+            floor,
+            this.state.cellAt(cr.pos).top,
+            () => {
+              if (iskey(floor) && this.getPossession(floor) === 255) {
+                this.setPossession(floor, -1);
+              }
+              this.setPossession(floor, this.getPossession(floor) + 1);
+              this.state.cellAt(cr.pos).top.id = Tile.Empty;
+              this.addSoundEffect(SND_ITEM_COLLECTED);
+            },
+          );
           break;
         case Tile.Burglar:
           this.setPossession(Tile.Boots_Ice, 0);
@@ -1479,11 +1633,19 @@ export class LynxLogic implements RulesetLogic {
           break;
         case Tile.ICChip:
           if (stationary) break;
-          if (this.state.chipsneeded) {
-            --this.state.chipsneeded;
-          }
-          this.state.cellAt(cr.pos).top.id = Tile.Empty;
-          this.addSoundEffect(SND_IC_COLLECTED);
+          this.runItemCollect(
+            cr,
+            cr.pos,
+            floor,
+            this.state.cellAt(cr.pos).top,
+            () => {
+              if (this.state.chipsneeded) {
+                --this.state.chipsneeded;
+              }
+              this.state.cellAt(cr.pos).top.id = Tile.Empty;
+              this.addSoundEffect(SND_IC_COLLECTED);
+            },
+          );
           break;
         case Tile.Socket:
           this.state.cellAt(cr.pos).top.id = Tile.Empty;
@@ -1531,17 +1693,27 @@ export class LynxLogic implements RulesetLogic {
     if (!survived) return false;
 
     switch (floor) {
-      case Tile.Bomb:
+      case Tile.Bomb: {
         if (stationary) break;
-        this.state.cellAt(cr.pos).top.id = Tile.Empty;
-        if (cr.id === Tile.Chip) {
-          this.removeChip(ChipStatus.CHIP_BOMBED, null);
-        } else {
-          this.addSoundEffect(SND_BOMB_EXPLODES);
-          this.removeCreature(cr, Tile.Bomb_Explosion);
-        }
-        survived = false;
+        const survivedBomb = this.runHazard(
+          cr,
+          cr.pos,
+          floor,
+          this.state.cellAt(cr.pos).top,
+          () => {
+            this.state.cellAt(cr.pos).top.id = Tile.Empty;
+            if (cr.id === Tile.Chip) {
+              this.removeChip(ChipStatus.CHIP_BOMBED, null);
+            } else {
+              this.addSoundEffect(SND_BOMB_EXPLODES);
+              this.removeCreature(cr, Tile.Bomb_Explosion);
+            }
+            return false;
+          },
+        );
+        if (!survivedBomb) survived = false;
         break;
+      }
       case Tile.Beartrap:
         if (stationary) break;
         this.addSoundEffect(SND_TRAP_ENTERED);
